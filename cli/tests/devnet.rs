@@ -101,7 +101,7 @@ impl Devnet {
         let output = Command::new(env!("CARGO_BIN_EXE_logos-escrow"))
             .args(args)
             .env("LEE_WALLET_HOME_DIR", &self.home)
-            .env("LOGOS_ESCROW_PROGRAM", &self.program)
+            .env("LOGOS_PROGRAM_ESCROW", &self.program)
             .env("LOGOS_ESCROW_ELF", elf)
             .output()
             .expect("run the CLI");

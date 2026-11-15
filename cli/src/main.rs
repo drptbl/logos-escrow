@@ -24,11 +24,15 @@ use lee_core::{
 use logos_escrow_core::{Hash32, Instruction, Job, JobState, job_account_id};
 use wallet::{AccountIdentity, AccountMention, WalletCore};
 
+/// The escrow program on the LEZ testnet, as the README's Deployment table records it.
+const TESTNET_PROGRAM: &str = "H1VFAwgBoB8ECWQntzNVE7NpyFneVmtGFmZhJGwcT3sF";
+
 #[derive(Parser)]
 #[command(about = "Drive the logos-escrow program from a LEZ wallet")]
 struct Args {
-    /// The escrow program's header account id (base58).
-    #[arg(long, env = "LOGOS_ESCROW_PROGRAM", global = true)]
+    /// The escrow program's header account id (base58): `LOGOS_PROGRAM_ESCROW`, which
+    /// logos-devnet exports, or the older `LOGOS_ESCROW_PROGRAM`, or else the testnet program.
+    #[arg(long, env = "LOGOS_PROGRAM_ESCROW", global = true)]
     program: Option<AccountId>,
     /// Send the call even when the job record says it will be refused, which a public call
     /// still pays for.
@@ -196,9 +200,13 @@ impl PayoutAddress {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let program = args
-        .program
-        .context("set --program or LOGOS_ESCROW_PROGRAM")?;
+    let program = match args.program {
+        Some(program) => program,
+        None => std::env::var("LOGOS_ESCROW_PROGRAM")
+            .unwrap_or_else(|_| TESTNET_PROGRAM.to_owned())
+            .parse()
+            .context("LOGOS_ESCROW_PROGRAM is not a base58 program id")?,
+    };
     let force = args.force;
     let wallet = WalletCore::from_env().context("open the wallet at LEE_WALLET_HOME_DIR")?;
     let mut escrow = Escrow {

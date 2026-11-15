@@ -225,10 +225,10 @@ escrow = { url = "https://github.com/drptbl/logos-escrow/releases/download/v0.2.
 
 ## CLI
 
-`cli/` is a small client on the same wallet code `lez_core` uses, with the wallet at `LEE_WALLET_HOME_DIR`. A call goes private when the signer is one of the wallet's private accounts or the payee is a private payout address:
+`cli/` is a small client on the same wallet code `lez_core` uses, with the wallet at `LEE_WALLET_HOME_DIR`. It calls the program `LOGOS_PROGRAM_ESCROW` names, which logos-devnet exports, or the testnet program when that's unset. A call goes private when the signer is one of the wallet's private accounts or the payee is a private payout address:
 
 ```bash
-export LEE_WALLET_HOME_DIR=~/my-wallet LOGOS_ESCROW_PROGRAM=<program id>
+export LEE_WALLET_HOME_DIR=~/my-wallet
 cargo run -p logos_escrow_cli -- open --buyer <id> --job-ref <hex> --provider <id> --pay-to <id> --refund-to <id> --amount 1000000 --in-secs 3600
 cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
 ```

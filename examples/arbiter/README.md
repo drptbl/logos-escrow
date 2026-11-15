@@ -34,7 +34,7 @@ From this directory:
 ```bash
 logos-devnet up
 source .logos-devnet/env
-export LEE_WALLET_HOME_DIR="$LOGOS_DEVNET_ACCOUNTS_PARTIES_WALLET" LOGOS_ESCROW_PROGRAM="$LOGOS_PROGRAM_ESCROW"
+export LEE_WALLET_HOME_DIR="$LOGOS_DEVNET_ACCOUNTS_PARTIES_WALLET"
 buyer=$(jq -r '.accounts[0].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
 provider=$(jq -r '.accounts[1].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
 judge=$(jq -r '.accounts[2].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
