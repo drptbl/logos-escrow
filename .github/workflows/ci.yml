@@ -36,6 +36,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config libssl-dev libpcsclite-dev
       - name: Install RISC Zero
+        env:
+          # rzup looks releases up through GitHub's API. Unauthenticated, that shares the
+          # runner IP's rate limit and fails when it runs out. This job's token only reads.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$HOME/.risc0/bin"
           curl -fsSL https://artifacts.risczero.net/rzup/prod/Linux-X64/rzup -o "$HOME/.risc0/bin/rzup"
