@@ -259,7 +259,6 @@ async fn main() -> Result<()> {
                     .context("deadline overflows")?,
                 (None, None) => bail!("set --deadline-ms or --in-secs"),
             };
-            check(force, open_preflight(deadline, now_ms()?))?;
             let instruction = Instruction::Open {
                 job_ref: job.job_ref,
                 provider,
@@ -269,6 +268,18 @@ async fn main() -> Result<()> {
                 deadline,
                 controller,
             };
+            let job_account = escrow.job_account(&job);
+            let exists = !escrow
+                .wallet
+                .get_account_public(job_account)
+                .await?
+                .data
+                .shard(escrow.program)
+                .is_empty();
+            check(
+                force,
+                open_preflight(&instruction, job.buyer, job_account, exists, now_ms()?),
+            )?;
             let accounts = vec![
                 escrow.signs(job.buyer),
                 escrow.mention(escrow.job_account(&job)),
@@ -396,20 +407,53 @@ fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
             "only an open job can be returned: it is {:?}",
             record.state
         )),
+        Call::Return if record.unreleased() == 0 => {
+            Err("everything is released, so nothing is left to return".into())
+        }
         _ => Ok(()),
     }
 }
 
-/// An `Open` must land before its deadline.
-fn open_preflight(deadline: u64, now: u64) -> Result<(), String> {
-    if now >= deadline {
-        Err(
+/// Why the escrow, or LEZ's deadline window, would refuse `open` for `buyer` at `now`, with
+/// `exists` saying whether `job` already holds a job. The terms check is the one `plan` makes
+/// in `core`.
+fn open_preflight(
+    open: &Instruction,
+    buyer: AccountId,
+    job: AccountId,
+    exists: bool,
+    now: u64,
+) -> Result<(), String> {
+    let Instruction::Open {
+        provider,
+        pay_to,
+        refund_to,
+        amount,
+        deadline,
+        ..
+    } = open
+    else {
+        return Err("not an Open".into());
+    };
+    if exists {
+        return Err("this job reference is used: the job account already holds a job".into());
+    }
+    if *amount == 0 {
+        return Err("the amount is zero".into());
+    }
+    if *provider == buyer {
+        return Err("the buyer can't be its own provider".into());
+    }
+    if *pay_to == job || *refund_to == job {
+        return Err("the job account can't be a payout address".into());
+    }
+    if now >= *deadline {
+        return Err(
             "the deadline has passed, so LEZ would refuse the call and charge its whole gas limit"
                 .into(),
-        )
-    } else {
-        Ok(())
+        );
     }
+    Ok(())
 }
 
 /// Stops before a call that would be refused, unless `--force`.
@@ -629,8 +673,63 @@ mod tests {
         let open = record(JobState::Open, 0, 0);
         assert!(preflight(&Call::Deliver, &open, DEADLINE).is_err());
         assert!(preflight(&Call::Refund, &open, DEADLINE - 1).is_err());
-        assert!(open_preflight(DEADLINE, DEADLINE).is_err());
-        assert_eq!(open_preflight(DEADLINE, DEADLINE - 1), Ok(()));
+        assert!(open_preflight(&open_terms(500), BUYER, JOB, false, DEADLINE).is_err());
+        assert_eq!(
+            open_preflight(&open_terms(500), BUYER, JOB, false, DEADLINE - 1),
+            Ok(())
+        );
+    }
+
+    const BUYER: AccountId = AccountId::new([1; 32]);
+    const PROVIDER: AccountId = AccountId::new([2; 32]);
+    const JOB: AccountId = AccountId::new([7; 32]);
+
+    fn open_terms(amount: Balance) -> Instruction {
+        Instruction::Open {
+            job_ref: [9; 32],
+            provider: PROVIDER,
+            pay_to: PROVIDER,
+            refund_to: BUYER,
+            amount,
+            deadline: DEADLINE,
+            controller: None,
+        }
+    }
+
+    #[test]
+    fn an_open_on_a_used_job_ref_is_refused() {
+        assert!(open_preflight(&open_terms(500), BUYER, JOB, true, DEADLINE - 1).is_err());
+    }
+
+    #[test]
+    fn an_open_with_terms_that_cannot_settle_is_refused() {
+        let now = DEADLINE - 1;
+        assert!(open_preflight(&open_terms(0), BUYER, JOB, false, now).is_err());
+        let with = |provider, pay_to, refund_to| Instruction::Open {
+            job_ref: [9; 32],
+            provider,
+            pay_to,
+            refund_to,
+            amount: 500,
+            deadline: DEADLINE,
+            controller: None,
+        };
+        for terms in [
+            with(BUYER, PROVIDER, BUYER),
+            with(PROVIDER, JOB, BUYER),
+            with(PROVIDER, PROVIDER, JOB),
+        ] {
+            assert!(
+                open_preflight(&terms, BUYER, JOB, false, now).is_err(),
+                "{terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_with_nothing_left_is_not_returned() {
+        let paid_in_full = record(JobState::Open, 500, 0);
+        assert!(preflight(&Call::Return, &paid_in_full, DEADLINE - 1).is_err());
     }
 
     #[test]
