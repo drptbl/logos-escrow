@@ -34,7 +34,7 @@ From this directory:
 ```bash
 logos-devnet up
 source .logos-devnet/env
-export LEE_WALLET_HOME_DIR="$LOGOS_DEVNET_ACCOUNTS_PARTIES_WALLET" LOGOS_ESCROW_PROGRAM="$LOGOS_PROGRAM_ESCROW"
+export LEE_WALLET_HOME_DIR="$LOGOS_DEVNET_ACCOUNTS_PARTIES_WALLET"
 buyer=$(jq -r '.accounts[0].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
 provider=$(jq -r '.accounts[1].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
 judge=$(jq -r '.accounts[2].id' "$LOGOS_DEVNET_ACCOUNTS_PARTIES")
@@ -51,6 +51,14 @@ The buyer locks 1M lepta for 10 minutes, with the judge deciding:
 arbiter open --judge "$judge" --provider "$provider" --pay-to "$provider" --refund-to "$buyer" --amount 1000000 --in-secs 600
 # tx <hash> in block <n>
 # job <job account>: Open, released 0, claimed 0
+```
+
+Before working on it, the provider checks the case: it exists, and names the judge they expect:
+
+```bash
+arbiter show
+# judge <judge>
+# job <job account>: Open, amount 1000000, released 0, claimed 0, pay_to <provider>, deadline <ms>
 ```
 
 The provider delivers. The record shows the result, still `Open` with `released: 0`:
@@ -83,6 +91,11 @@ escrow refund
 ```
 
 `logos-devnet up` takes about 20 s and the calls another 20 s, once `cargo` has built the two CLIs. `logos-devnet down` stops the devnet, and deleting `.logos-devnet` removes it.
+
+## Before you take a job
+
+- **Check the case.** A buyer can open a job straight on the escrow and still name the arbiter as its controller. That job has no case, and can never get one, so no judge can decide it and the buyer refunds everything after the deadline. `arbiter show` refuses such a job.
+- **Check the deadline.** It's the judge's last chance to release, and from then on the buyer can refund what was never released. A delivery just before the deadline leaves the judge no time, so take a job only with time for the judge after the work is due.
 
 ## Use it in your project
 

@@ -54,11 +54,13 @@ A job can name a controller at `Open`, a program that acts on it besides the buy
 - The controller can `Release` any part of what's left and `Return` the job without the parties. Those are an arbiter's two decisions: pay the provider, or give the rest back.
 - `Deliver`, `Claim` and `Refund` still need the party they name, even from the controller. So only the side being paid pulls a payout, and a controller can't pull one publicly to a private payout address, where it would be lost. A party that is the controller's own PDA signs through it, with `pda_seeds` in the chained call.
 - On a controlled job, delivering only records the result. The provider gets paid when the buyer or the controller releases.
-- The parties keep their direct calls. The deadline still lets the buyer refund what was never released, so a stuck controller can't lock the money.
+- The parties keep their direct calls. The deadline still lets the buyer refund what was never released, so a stuck controller can't lock the money. It's also the controller's last chance to release, so set a deadline that leaves it time after the work is due: a delivery just before the deadline leaves it none.
 - A program can only act on jobs that name it. A program that opens a job has to name itself, and a call from any other program is refused with `NotDirect`.
 - A party that is a program's PDA can only act through that program, so that program has to be the job's controller. Make a PDA provider for a job controlled by another program, or by none, and it can never deliver or claim: whatever was released to it stays in the job account.
 
 The controller decides who gets the money, never where it goes: payouts only reach `pay_to` and `refund_to`. Read what the controller does, and whether it can be updated, before you open or take a controlled job.
+
+A buyer can open a job directly and still name any controller. That suits a controller that keeps no state of its own, but one that keeps a record per job, as the example arbiter does with its cases, only works for jobs opened through it. A provider checks that record before starting work: a job with no record names a controller that can never decide it.
 
 LEZ `v0.3.1` carries a signer's authorization into every chained call, so a program you sign a transaction for can open a job with your lepta, just as it could transfer them. The controller rule protects your existing jobs, not a signature you give a hostile program.
 
@@ -151,6 +153,8 @@ The record is Borsh:
 
 `core/tests/escrow.rs` (`the_job_record_and_controlled_open_layout_are_stable`) pins a whole record against a literal.
 
+Read the counters to tell whether a job is settled, rather than `state`: a job released in full and claimed stays `Open`. Nothing is left to pay once `claimed` equals `released` and either `released` equals `amount` or the job is `Refunded`.
+
 ## Private accounts
 
 Buyer and provider can act from private accounts. The job stays public: anyone can read its record, amount, deadline and payout addresses, and the buyer and provider show up there as private account ids. What's hidden is which funds paid in and where the payouts end up, since nothing links those private accounts to a wallet.
@@ -225,10 +229,10 @@ escrow = { url = "https://github.com/drptbl/logos-escrow/releases/download/v0.2.
 
 ## CLI
 
-`cli/` is a small client on the same wallet code `lez_core` uses, with the wallet at `LEE_WALLET_HOME_DIR`. A call goes private when the signer is one of the wallet's private accounts or the payee is a private payout address:
+`cli/` is a small client on the same wallet code `lez_core` uses, with the wallet at `LEE_WALLET_HOME_DIR`. It calls the program `LOGOS_PROGRAM_ESCROW` names, which logos-devnet exports, or the testnet program when that's unset. A call goes private when the signer is one of the wallet's private accounts or the payee is a private payout address:
 
 ```bash
-export LEE_WALLET_HOME_DIR=~/my-wallet LOGOS_ESCROW_PROGRAM=<program id>
+export LEE_WALLET_HOME_DIR=~/my-wallet
 cargo run -p logos_escrow_cli -- open --buyer <id> --job-ref <hex> --provider <id> --pay-to <id> --refund-to <id> --amount 1000000 --in-secs 3600
 cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
 ```
@@ -246,6 +250,8 @@ cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
 | `payout-address --owner <id> --out <file>` | Makes a fresh private payout address, see below. |
 
 Every command names the job with `--buyer` and `--job-ref` (64 hex characters), and each call prints the job's record once it lands. `--payer` pays a public call's fee from another wallet account.
+
+Before it sends, the CLI checks the job record and its own clock, and stops a call the escrow or the deadline window would refuse, since a refused public call still pays its fee and one outside the window pays its whole gas limit. `--force` sends it anyway.
 
 `payout-address` makes a fresh private address under one of your private accounts' keys, prints its id for `open`, and writes the file you pass as `--payee-address` when you claim or refund to it. Keep that file: its identifier is the only way to reach a fresh address, so the command never overwrites one. Once your wallet holds the address, the CLI uses it directly. For someone else's public account, pass `--public-payee`. Otherwise the CLI refuses a payout it can't place.
 

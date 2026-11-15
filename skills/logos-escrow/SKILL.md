@@ -9,7 +9,7 @@ description: Integrate the logos-escrow job escrow on the Logos Execution Zone (
 
 ## Settle a job from a client
 
-1. Take the program id from the README's Deployment table, or from `LOGOS_PROGRAM_ESCROW` on a devnet.
+1. Take the program id from the README's Deployment table, or from `LOGOS_PROGRAM_ESCROW` on a devnet. The escrow's CLI reads that variable too, and falls back to the testnet program.
 2. Derive the job account from the buyer and a 32-byte `job_ref` (README, Job account). A `job_ref` is spent for that buyer once opened, so make each one fresh.
 3. Before every call after `Open`, read the job record (README, Reading a job) and quote it: `Deliver` takes the record's `deadline`, `Claim` at most `released - claimed`, and `Refund` exactly `amount - released`, with `deadline` 0 after a `Return`.
 4. Send the call (README, Calling it with `lez_core`), signed by the party the instruction names, with the accounts in the README's order.
@@ -21,7 +21,8 @@ Rules every call keeps:
 - Pull to a private payout address only from a private call (README, Private accounts). A public pull lands the money in a public account nobody can sign for.
 - Size the fee reserve: the payer must hold `gas_limit` × base fee up front (base fee 8 on LEZ v0.3.1), and a failure that isn't the program's exit code charges all of it. A `gas_limit` of 200,000 is plenty for any escrow call.
 - Deadlines are milliseconds since the Unix epoch, checked against the block's timestamp: `Open` and `Deliver` land before it, a deadline `Refund` at or after it.
-- As a provider, read `pay_to`, `amount`, `deadline` and `controller` from the record before you start the work.
+- As a provider, read `pay_to`, `amount`, `deadline` and `controller` from the record before you start the work. On a controlled job, also read the controller's own record for the job, such as the example arbiter's case: a buyer can open a job directly and name a controller that keeps no record of it, and so can never decide it. Take the job only with time for the controller between the work being due and the deadline, when the buyer can refund what was never released.
+- Tell a settled job by its counters, never by `state` alone: nothing is left once `claimed` equals `released` and either `released` equals `amount` or the job is `Refunded`.
 
 ## Build a controller program
 
