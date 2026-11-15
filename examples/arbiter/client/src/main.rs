@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use lee_core::account::{AccountId, Balance};
-use logos_escrow_arbiter::{ArbiterInstruction, Decision, case_account_id};
+use logos_escrow_arbiter::{ArbiterInstruction, Case, Decision, case_account_id};
 use logos_escrow_core::{Hash32, Job, job_account_id};
 use wallet::{AccountIdentity, AccountMention, WalletCore};
 
@@ -68,6 +68,11 @@ enum Command {
         #[arg(long)]
         judge: AccountId,
     },
+    /// Provider: check the job's case before working on it, and print the job.
+    Show {
+        #[command(flatten)]
+        job: JobArgs,
+    },
 }
 
 fn parse_hash(text: &str) -> Result<Hash32> {
@@ -124,6 +129,7 @@ async fn main() -> Result<()> {
             };
             client.send(&job, judge, &[job.buyer], &decide).await
         }
+        Command::Show { job } => client.show(&job).await,
         Command::Return { job, judge } => {
             let provider = client.job(&job).await?.provider;
             let decide = ArbiterInstruction::Decide {
@@ -189,6 +195,42 @@ impl Client {
         println!(
             "job {job_account}: {:?}, released {}, claimed {}",
             record.state, record.released, record.claimed
+        );
+        Ok(())
+    }
+
+    /// Prints the case and the job. A job opened straight on the escrow can still name the
+    /// arbiter as its controller, but then it has no case and nobody can ever decide it.
+    async fn show(&self, job: &JobArgs) -> Result<()> {
+        let case_account = case_account_id(&self.arbiter, &self.job_account(job));
+        let shard = self
+            .wallet
+            .get_account_public(case_account)
+            .await?
+            .data
+            .shard(self.arbiter)
+            .to_vec();
+        let record = self.job(job).await?;
+        if shard.is_empty() {
+            bail!(
+                "no case at {case_account}: the job wasn't opened through this arbiter, so no \
+                 judge can ever decide it"
+            );
+        }
+        let case: Case = borsh::from_slice(&shard)?;
+        if case.escrow != self.escrow || record.controller != Some(self.arbiter) {
+            bail!("the case or the job names another escrow or controller: don't work on it");
+        }
+        println!("judge {}", case.judge);
+        println!(
+            "job {}: {:?}, amount {}, released {}, claimed {}, pay_to {}, deadline {}",
+            self.job_account(job),
+            record.state,
+            record.amount,
+            record.released,
+            record.claimed,
+            record.pay_to,
+            record.deadline
         );
         Ok(())
     }
