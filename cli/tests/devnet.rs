@@ -238,11 +238,13 @@ async fn every_flow_settles_on_a_devnet() {
         "600",
     ];
     assert_eq!(devnet.call(&open), "Open");
-    // A claim before delivery is refused and moves nothing.
+    // A claim before delivery is refused on chain and moves nothing. `--force` skips the CLI's
+    // own check, which would stop it before it sends.
     assert_eq!(
         devnet.call(&[
             "--payer",
             &payer,
+            "--force",
             "claim",
             "--buyer",
             &buyer,

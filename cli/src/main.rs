@@ -30,6 +30,10 @@ struct Args {
     /// The escrow program's header account id (base58).
     #[arg(long, env = "LOGOS_ESCROW_PROGRAM", global = true)]
     program: Option<AccountId>,
+    /// Send the call even when the job record says it will be refused, which a public call
+    /// still pays for.
+    #[arg(long, global = true)]
+    force: bool,
     /// A wallet account that pays a public transaction's fee; by default the signer pays.
     /// Private transactions are fee-exempt.
     #[arg(long, global = true)]
@@ -195,6 +199,7 @@ async fn main() -> Result<()> {
     let program = args
         .program
         .context("set --program or LOGOS_ESCROW_PROGRAM")?;
+    let force = args.force;
     let wallet = WalletCore::from_env().context("open the wallet at LEE_WALLET_HOME_DIR")?;
     let mut escrow = Escrow {
         wallet,
@@ -246,6 +251,7 @@ async fn main() -> Result<()> {
                     .context("deadline overflows")?,
                 (None, None) => bail!("set --deadline-ms or --in-secs"),
             };
+            check(force, open_preflight(deadline, now_ms()?))?;
             let instruction = Instruction::Open {
                 job_ref: job.job_ref,
                 provider,
@@ -263,6 +269,7 @@ async fn main() -> Result<()> {
         }
         Command::Deliver { job, result } => {
             let record = escrow.record(&job).await?;
+            check(force, preflight(&Call::Deliver, &record, now_ms()?))?;
             let instruction = Instruction::Deliver {
                 result,
                 deadline: record.deadline,
@@ -277,6 +284,7 @@ async fn main() -> Result<()> {
             // Sync first, so a payout address someone already paid into is used as the wallet's own.
             escrow.wallet.sync_to_latest_block().await?;
             let record = escrow.record(&payout.job).await?;
+            check(force, preflight(&Call::Claim, &record, now_ms()?))?;
             let instruction = Instruction::Claim {
                 buyer: payout.job.buyer,
                 job_ref: payout.job.job_ref,
@@ -286,13 +294,9 @@ async fn main() -> Result<()> {
             escrow.send(&payout.job, accounts, &instruction).await?;
         }
         Command::Release { job, amount } => {
-            let amount = match amount {
-                Some(amount) => amount,
-                None => {
-                    let record = escrow.record(&job).await?;
-                    record.unreleased()
-                }
-            };
+            let record = escrow.record(&job).await?;
+            let amount = amount.unwrap_or_else(|| record.unreleased());
+            check(force, preflight(&Call::Release(amount), &record, now_ms()?))?;
             let instruction = Instruction::Release {
                 job_ref: job.job_ref,
                 amount,
@@ -306,6 +310,7 @@ async fn main() -> Result<()> {
         Command::Refund(payout) => {
             escrow.wallet.sync_to_latest_block().await?;
             let record = escrow.record(&payout.job).await?;
+            check(force, preflight(&Call::Refund, &record, now_ms()?))?;
             let instruction = Instruction::Refund {
                 job_ref: payout.job.job_ref,
                 amount: record.unreleased(),
@@ -321,6 +326,7 @@ async fn main() -> Result<()> {
         }
         Command::Return(job) => {
             let record = escrow.record(&job).await?;
+            check(force, preflight(&Call::Return, &record, now_ms()?))?;
             let accounts = vec![
                 escrow.signs(record.provider),
                 escrow.mention(escrow.job_account(&job)),
@@ -329,6 +335,81 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A call the CLI is about to send, to check against the job record first.
+#[derive(Debug)]
+enum Call {
+    Deliver,
+    Claim,
+    Release(Balance),
+    Refund,
+    Return,
+}
+
+/// Why the escrow, or LEZ's deadline window, would refuse `call` on `record` at `now` (in
+/// milliseconds). A refused public call is still included and charged, and one outside the
+/// deadline window pays its whole gas limit, so the CLI checks before it sends. The clock is
+/// this machine's, which can differ a little from the block's.
+fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
+    let open = record.state == JobState::Open;
+    match call {
+        Call::Deliver if !open || record.result.is_some() => Err(format!(
+            "the job can't be delivered: it is {:?}{}",
+            record.state,
+            if record.result.is_some() {
+                ", with a result already"
+            } else {
+                ""
+            }
+        )),
+        Call::Deliver if now >= record.deadline => Err(
+            "the deadline has passed, so LEZ would refuse the call and charge its whole gas limit"
+                .into(),
+        ),
+        Call::Claim if record.claimable() == 0 => Err("nothing is released and unclaimed".into()),
+        Call::Release(_) if !open => Err(format!(
+            "only an open job can be released: it is {:?}",
+            record.state
+        )),
+        Call::Release(amount) if *amount == 0 || *amount > record.unreleased() => {
+            Err(format!("{} lepta are left to release", record.unreleased()))
+        }
+        Call::Refund if !matches!(record.state, JobState::Open | JobState::Returned) => Err(
+            format!("the job can't be refunded: it is {:?}", record.state),
+        ),
+        Call::Refund if open && now < record.deadline => Err(
+            "the deadline hasn't passed, so LEZ would refuse the call and charge its whole gas \
+             limit"
+                .into(),
+        ),
+        Call::Refund if record.unreleased() == 0 => Err("nothing is left to refund".into()),
+        Call::Return if !open => Err(format!(
+            "only an open job can be returned: it is {:?}",
+            record.state
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An `Open` must land before its deadline.
+fn open_preflight(deadline: u64, now: u64) -> Result<(), String> {
+    if now >= deadline {
+        Err(
+            "the deadline has passed, so LEZ would refuse the call and charge its whole gas limit"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// Stops before a call that would be refused, unless `--force`.
+fn check(force: bool, verdict: Result<(), String>) -> Result<()> {
+    match verdict {
+        Err(why) if !force => bail!("not sent: {why} (pass --force to send it anyway)"),
+        _ => Ok(()),
+    }
 }
 
 fn now_ms() -> Result<u64> {
@@ -504,6 +585,69 @@ impl Escrow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEADLINE: u64 = 1_800_000_000_000;
+
+    fn record(state: JobState, released: Balance, claimed: Balance) -> Job {
+        Job {
+            buyer: AccountId::new([1; 32]),
+            provider: AccountId::new([2; 32]),
+            pay_to: AccountId::new([2; 32]),
+            refund_to: AccountId::new([1; 32]),
+            amount: 500,
+            released,
+            claimed,
+            deadline: DEADLINE,
+            state,
+            result: None,
+            controller: None,
+        }
+    }
+
+    #[test]
+    fn calls_the_record_allows_pass_the_preflight() {
+        let open = record(JobState::Open, 200, 0);
+        assert_eq!(preflight(&Call::Deliver, &open, DEADLINE - 1), Ok(()));
+        assert_eq!(preflight(&Call::Claim, &open, DEADLINE + 1), Ok(()));
+        assert_eq!(preflight(&Call::Release(300), &open, DEADLINE + 1), Ok(()));
+        assert_eq!(preflight(&Call::Refund, &open, DEADLINE), Ok(()));
+        assert_eq!(preflight(&Call::Return, &open, DEADLINE + 1), Ok(()));
+        let returned = record(JobState::Returned, 0, 0);
+        assert_eq!(preflight(&Call::Refund, &returned, DEADLINE - 1), Ok(()));
+    }
+
+    #[test]
+    fn a_call_outside_the_deadline_window_is_refused_before_it_costs_the_gas_limit() {
+        let open = record(JobState::Open, 0, 0);
+        assert!(preflight(&Call::Deliver, &open, DEADLINE).is_err());
+        assert!(preflight(&Call::Refund, &open, DEADLINE - 1).is_err());
+        assert!(open_preflight(DEADLINE, DEADLINE).is_err());
+        assert_eq!(open_preflight(DEADLINE, DEADLINE - 1), Ok(()));
+    }
+
+    #[test]
+    fn a_call_with_nothing_to_move_is_refused() {
+        assert!(preflight(&Call::Claim, &record(JobState::Open, 200, 200), 0).is_err());
+        assert!(preflight(&Call::Release(301), &record(JobState::Open, 200, 0), 0).is_err());
+        assert!(preflight(&Call::Release(0), &record(JobState::Open, 0, 0), 0).is_err());
+        assert!(preflight(&Call::Refund, &record(JobState::Open, 500, 0), DEADLINE).is_err());
+    }
+
+    #[test]
+    fn a_call_the_job_state_rules_out_is_refused() {
+        let delivered = record(JobState::Delivered, 500, 0);
+        for call in [Call::Deliver, Call::Release(1), Call::Refund, Call::Return] {
+            assert!(
+                preflight(&call, &delivered, DEADLINE - 1).is_err(),
+                "{call:?}"
+            );
+        }
+        let mut controlled_and_delivered = record(JobState::Open, 0, 0);
+        controlled_and_delivered.result = Some([4; 32]);
+        assert!(preflight(&Call::Deliver, &controlled_and_delivered, DEADLINE - 1).is_err());
+        let refunded = record(JobState::Refunded, 0, 0);
+        assert!(preflight(&Call::Refund, &refunded, DEADLINE).is_err());
+    }
 
     fn address() -> PayoutAddress {
         PayoutAddress {

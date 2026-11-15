@@ -247,6 +247,8 @@ cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
 
 Every command names the job with `--buyer` and `--job-ref` (64 hex characters), and each call prints the job's record once it lands. `--payer` pays a public call's fee from another wallet account.
 
+Before it sends, the CLI checks the job record and its own clock, and stops a call the escrow or the deadline window would refuse, since a refused public call still pays its fee and one outside the window pays its whole gas limit. `--force` sends it anyway.
+
 `payout-address` makes a fresh private address under one of your private accounts' keys, prints its id for `open`, and writes the file you pass as `--payee-address` when you claim or refund to it. Keep that file: its identifier is the only way to reach a fresh address, so the command never overwrites one. Once your wallet holds the address, the CLI uses it directly. For someone else's public account, pass `--public-payee`. Otherwise the CLI refuses a payout it can't place.
 
 ## Build and test
