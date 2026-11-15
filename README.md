@@ -54,11 +54,13 @@ A job can name a controller at `Open`, a program that acts on it besides the buy
 - The controller can `Release` any part of what's left and `Return` the job without the parties. Those are an arbiter's two decisions: pay the provider, or give the rest back.
 - `Deliver`, `Claim` and `Refund` still need the party they name, even from the controller. So only the side being paid pulls a payout, and a controller can't pull one publicly to a private payout address, where it would be lost. A party that is the controller's own PDA signs through it, with `pda_seeds` in the chained call.
 - On a controlled job, delivering only records the result. The provider gets paid when the buyer or the controller releases.
-- The parties keep their direct calls. The deadline still lets the buyer refund what was never released, so a stuck controller can't lock the money.
+- The parties keep their direct calls. The deadline still lets the buyer refund what was never released, so a stuck controller can't lock the money. It's also the controller's last chance to release, so set a deadline that leaves it time after the work is due: a delivery just before the deadline leaves it none.
 - A program can only act on jobs that name it. A program that opens a job has to name itself, and a call from any other program is refused with `NotDirect`.
 - A party that is a program's PDA can only act through that program, so that program has to be the job's controller. Make a PDA provider for a job controlled by another program, or by none, and it can never deliver or claim: whatever was released to it stays in the job account.
 
 The controller decides who gets the money, never where it goes: payouts only reach `pay_to` and `refund_to`. Read what the controller does, and whether it can be updated, before you open or take a controlled job.
+
+A buyer can open a job directly and still name any controller. That suits a controller that keeps no state of its own, but one that keeps a record per job, as the example arbiter does with its cases, only works for jobs opened through it. A provider checks that record before starting work: a job with no record names a controller that can never decide it.
 
 LEZ `v0.3.1` carries a signer's authorization into every chained call, so a program you sign a transaction for can open a job with your lepta, just as it could transfer them. The controller rule protects your existing jobs, not a signature you give a hostile program.
 
@@ -150,6 +152,8 @@ The record is Borsh:
 | `controller` | `Option<[u8; 32]>` |
 
 `core/tests/escrow.rs` (`the_job_record_and_controlled_open_layout_are_stable`) pins a whole record against a literal.
+
+Read the counters to tell whether a job is settled, rather than `state`: a job released in full and claimed stays `Open`. Nothing is left to pay once `claimed` equals `released` and either `released` equals `amount` or the job is `Refunded`.
 
 ## Private accounts
 
