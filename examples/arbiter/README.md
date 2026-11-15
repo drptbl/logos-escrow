@@ -95,7 +95,7 @@ escrow refund
 ## Before you take a job
 
 - **Check the case.** A buyer can open a job straight on the escrow and still name the arbiter as its controller. That job has no case, and can never get one, so no judge can decide it and the buyer refunds everything after the deadline. `arbiter show` refuses such a job.
-- **Check the deadline.** It's the judge's last chance to release, and from then on the buyer can refund what was never released. A delivery just before the deadline leaves the judge no time, so take a job only with time for the judge after the work is due.
+- **Check the deadline.** From then on the buyer can refund what was never released. The judge can still release after it, but only a release that lands before the refund counts. A delivery just before the deadline leaves the judge no time, so take a job only with time for the judge after the work is due.
 
 ## Use it in your project
 
