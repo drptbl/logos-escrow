@@ -938,3 +938,45 @@ fn a_finished_job_cannot_be_refunded_again() {
         );
     }
 }
+
+/// The codes a client reads a refusal by, as the README's error table numbers them.
+#[test]
+fn error_codes_are_stable() {
+    let codes = [
+        (EscrowError::InvalidInstruction, 1),
+        (EscrowError::Unauthorized, 2),
+        (EscrowError::WrongJobAccount, 3),
+        (EscrowError::JobExists, 4),
+        (EscrowError::InvalidTerms, 5),
+        (EscrowError::WrongParty, 6),
+        (EscrowError::WrongDeadline, 7),
+        (EscrowError::NoJob, 8),
+        (EscrowError::WrongState, 9),
+        (EscrowError::WrongAmount, 10),
+        (EscrowError::NotDirect, 11),
+    ];
+    for (error, code) in codes {
+        assert_eq!(error.code(), code, "{error:?}");
+    }
+}
+
+#[test]
+fn the_job_takes_the_party_from_the_step_not_from_the_sender() {
+    // A private sender shows up under a blinded alias, so the job's actor must not read `from`.
+    let sent = at_party(signed(PROVIDER), &deliver()).expect("deliver plans");
+    let step = sent
+        .sync_messages
+        .iter()
+        .find(|message| message.to.program_account_id == PROGRAM)
+        .expect("a step");
+    let alias = AccountId::new([0xAA; 32]);
+    let applied = handle(&ReceiveInput {
+        receiver: step.to,
+        from: Some(Actor::new(alias, PROGRAM)),
+        is_authorized: true,
+        pre_state: ActorState::from(opened()),
+        message: step.message.clone(),
+    })
+    .expect("the provider's step applies whatever the sender's address");
+    assert_eq!(record(&applied).state, JobState::Delivered);
+}

@@ -7,17 +7,17 @@ use std::{borrow::Cow, collections::BTreeMap};
 
 use lee::{
     PrivateKey, PublicAccountEvidence, PublicKey, PublicTransaction, V03State,
-    error::LeeError,
+    error::{InvalidProgramBehaviorError, LeeError},
     program::Program,
     public_transaction::{Message, WitnessSet},
 };
 use lee_core::{
     account::{AccountId, Actor, Balance},
-    native_token::Message as NativeMessage,
+    native_token::{Message as NativeMessage, TransferError},
     program::PdaSeed,
 };
-use logos_escrow_arbiter::{ArbiterError, ArbiterInstruction, Decision, case_account_id};
-use logos_escrow_core::{EscrowError, Instruction, Job, JobState, job_account_id};
+use logos_escrow_arbiter::{ArbiterInstruction, Decision, case_account_id};
+use logos_escrow_core::{Instruction, Job, JobState, job_account_id};
 
 const GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -312,9 +312,9 @@ fn give_back() -> Instruction {
     }
 }
 
-/// Whether `result` is the escrow refusing with `error`.
-fn refused(result: &Result<(), LeeError>, error: EscrowError) -> bool {
-    matches!(result, Err(LeeError::ProgramExitedWithCode { code, .. }) if *code == u32::from(error.code()))
+/// Whether `result` is a program exiting with `code`, as the README's error table numbers it.
+fn refused(result: &Result<(), LeeError>, code: u32) -> bool {
+    matches!(result, Err(LeeError::ProgramExitedWithCode { code: exited, .. }) if *exited == code)
 }
 
 fn release_of(amount: Balance) -> Instruction {
@@ -422,7 +422,7 @@ fn a_refused_call_exits_with_its_code_and_moves_nothing() {
     chain.open().expect("open");
     // Claiming before anything is released.
     let early = chain.claim_of(AMOUNT);
-    assert!(refused(&early, EscrowError::WrongAmount), "{early:?}");
+    assert!(refused(&early, 10), "{early:?}");
     assert_eq!(chain.balance(job()), AMOUNT);
     assert_eq!(chain.job().claimed, 0);
 }
@@ -443,7 +443,17 @@ fn nobody_can_move_the_deposit_without_the_escrow_program() {
         },
         BEFORE,
     );
-    assert!(drain.is_err(), "{drain:?}");
+    assert!(
+        matches!(
+            &drain,
+            Err(LeeError::InvalidProgramBehavior(
+                InvalidProgramBehaviorError::NativeTransferFailed(
+                    TransferError::UnauthorizedSender { account_id }
+                )
+            )) if *account_id == job()
+        ),
+        "{drain:?}"
+    );
     assert_eq!(chain.balance(job()), AMOUNT);
 }
 
@@ -470,7 +480,7 @@ fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
     // On a controlled job, delivering releases nothing: the controller judges it.
     chain.deliver(BEFORE).expect("deliver");
     assert_eq!(chain.job().released, 0);
-    assert!(refused(&chain.claim_of(AMOUNT), EscrowError::WrongAmount));
+    assert!(refused(&chain.claim_of(AMOUNT), 10));
     chain
         .relay(
             &operator(),
@@ -530,10 +540,7 @@ fn a_program_cannot_act_on_a_job_it_does_not_control_even_when_the_buyer_signs()
             vec![evidence(&refund_to())],
             BEFORE,
         );
-        assert!(
-            refused(&result, EscrowError::NotDirect),
-            "{instruction:?}: {result:?}"
-        );
+        assert!(refused(&result, 11), "{instruction:?}: {result:?}");
     }
     assert_eq!(chain.job().released, 0);
     assert_eq!(chain.balance(job()), AMOUNT);
@@ -553,10 +560,7 @@ fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
             vec![],
             BEFORE,
         );
-        assert!(
-            refused(&result, EscrowError::NotDirect),
-            "{named:?}: {result:?}"
-        );
+        assert!(refused(&result, 11), "{named:?}: {result:?}");
     }
     assert_eq!(chain.balance(buyer().id), START);
 
@@ -586,7 +590,7 @@ fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
         vec![evidence(&pay_to())],
         BEFORE,
     );
-    assert!(refused(&result, EscrowError::Unauthorized), "{result:?}");
+    assert!(refused(&result, 2), "{result:?}");
     assert_eq!(chain.balance(job()), AMOUNT);
 }
 
@@ -653,10 +657,7 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
         vec![evidence(&refund_to())],
         DEADLINE,
     );
-    assert!(
-        refused(&unseeded, EscrowError::Unauthorized),
-        "{unseeded:?}"
-    );
+    assert!(refused(&unseeded, 2), "{unseeded:?}");
     chain
         .relay(
             &operator(),
@@ -762,10 +763,84 @@ fn only_the_cases_judge_decides() {
         &decide(Decision::Release { amount: AMOUNT }),
         &[escrow(buyer().id)],
     );
-    assert!(
-        matches!(&result, Err(LeeError::ProgramExitedWithCode { code, .. })
-            if *code == u32::from(ArbiterError::WrongJudge.code())),
-        "{result:?}"
+    assert!(refused(&result, 105), "{result:?}");
+    assert_eq!(chain.job().released, 0);
+}
+
+#[test]
+fn a_message_that_does_not_decode_exits_with_code_1() {
+    let mut chain = Chain::new();
+    let garbage = chain.send(
+        &buyer(),
+        escrow(buyer().id),
+        &[escrow(buyer().id)],
+        Vec::new(),
+        &[0xff_u8],
+        BEFORE,
     );
+    assert!(refused(&garbage, 1), "{garbage:?}");
+}
+
+#[test]
+fn a_message_straight_to_a_jobs_actor_cannot_touch_the_job() {
+    let mut chain = Chain::new();
+    chain.open().expect("open");
+    // Sent to the job's actor, an instruction is the job account acting as a party: here as a
+    // buyer, naming a job of its own that doesn't exist.
+    let result = chain.send(
+        &buyer(),
+        escrow(job()),
+        &[escrow(job()), escrow(job_for(job()))],
+        Vec::new(),
+        &release_of(AMOUNT),
+        BEFORE,
+    );
+    assert!(refused(&result, 8), "{result:?}");
+    assert_eq!(chain.job().released, 0);
+}
+
+#[test]
+fn a_controller_cannot_open_a_job_for_a_buyer_who_did_not_sign() {
+    let mut chain = Chain::new();
+    let result = chain.relay(
+        &operator(),
+        buyer().id,
+        vec![],
+        &open_instruction(Some(CONTROLLER)),
+        &[native(buyer().id), native(job())],
+        vec![],
+        BEFORE,
+    );
+    assert!(refused(&result, 2), "{result:?}");
+    assert_eq!(chain.balance(buyer().id), START);
+}
+
+#[test]
+fn a_judge_decides_only_by_a_direct_call() {
+    let mut chain = Chain::new();
+    open_with_judge(&mut chain);
+    // The judge signs a call to some program, which relays a decision to the arbiter.
+    let relayed = (
+        ARBITER,
+        operator().id,
+        Vec::<[u8; 32]>::new(),
+        borsh::to_vec(&decide(Decision::Release { amount: AMOUNT })).expect("serializes"),
+    );
+    let root = Actor::new(operator().id, CONTROLLER);
+    let result = chain.send(
+        &operator(),
+        root,
+        &[
+            root,
+            Actor::new(operator().id, ARBITER),
+            Actor::new(case(), ARBITER),
+            escrow(buyer().id),
+            escrow(job()),
+        ],
+        Vec::new(),
+        &relayed,
+        BEFORE,
+    );
+    assert!(refused(&result, 108), "{result:?}");
     assert_eq!(chain.job().released, 0);
 }
