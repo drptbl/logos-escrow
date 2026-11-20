@@ -544,24 +544,40 @@ fn a_step_for_another_jobs_account_is_refused() {
 
 #[test]
 fn only_the_escrow_itself_steps_a_job() {
-    // A step from another program decodes as an instruction to the job account's own actor,
-    // which isn't a party and changes nothing about this job.
+    // A step's bytes, sent by another program, don't decode as an instruction.
     let sent = at_party(signed(BUYER), &open()).expect("open plans");
     let step = sent
         .sync_messages
         .iter()
         .find(|message| message.to.program_account_id == PROGRAM)
         .expect("a step");
-    let forged = handle(&ReceiveInput {
-        receiver: Actor::new(job(), PROGRAM),
-        from: Some(Actor::new(OTHER_PROGRAM, OTHER_PROGRAM)),
-        is_authorized: true,
-        pre_state: ActorState::from(opened()),
-        message: step.message.clone(),
-    });
-    if let Ok(response) = forged {
-        assert_eq!(response.post_state, None);
-    }
+    let at_the_job = |caller: AccountId, message: Vec<u8>| {
+        handle(&ReceiveInput {
+            receiver: Actor::new(job(), PROGRAM),
+            from: Some(Actor::new(caller, caller)),
+            is_authorized: true,
+            pre_state: ActorState::from(opened_controlled()),
+            message,
+        })
+    };
+    assert_eq!(
+        at_the_job(OTHER_PROGRAM, step.message.clone()).map(drop),
+        Err(EscrowError::InvalidInstruction)
+    );
+    // An instruction there, even from the job's own controller, is the job account acting as a
+    // party: as a buyer it names another job, and it isn't this job's provider.
+    let release = at_the_job(CONTROLLER, borsh::to_vec(&release()).expect("serializes"))
+        .expect("plans a step for the job account's own job");
+    assert_eq!(
+        at_job(job(), &release, &[]).map(drop),
+        Err(EscrowError::NoJob)
+    );
+    let give_back = at_the_job(CONTROLLER, borsh::to_vec(&give_back()).expect("serializes"))
+        .expect("plans a step for this job");
+    assert_eq!(
+        at_job(job(), &give_back, &opened_controlled()).map(drop),
+        Err(EscrowError::WrongParty)
+    );
 }
 
 /// Literals computed independently (Python `hashlib` and the borsh spec), so a caller that
