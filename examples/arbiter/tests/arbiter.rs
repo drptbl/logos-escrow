@@ -229,6 +229,24 @@ fn a_decision_needs_the_judge_to_sign_directly() {
 }
 
 #[test]
+fn only_the_arbiter_itself_reaches_a_case() {
+    // Another program's message to a case's actor is a call from the case account, which can't
+    // sign.
+    let sent = at_signer(JUDGE, true, None, &release(ESCROW)).expect("plans");
+    assert_eq!(
+        handle(&ReceiveInput {
+            receiver: to_case(&sent).to,
+            from: Some(Actor::new(ATTACKER, ATTACKER)),
+            is_authorized: false,
+            pre_state: ActorState::from(opened()),
+            message: borsh::to_vec(&release(ESCROW)).expect("serializes"),
+        })
+        .map(drop),
+        Err(ArbiterError::Unauthorized)
+    );
+}
+
+#[test]
 fn a_decision_needs_a_case() {
     let sent = at_signer(JUDGE, true, None, &release(ESCROW)).expect("plans");
     assert_eq!(
@@ -247,7 +265,6 @@ fn arbiter_codes_do_not_overlap_the_escrows() {
         ArbiterError::WrongCase,
         ArbiterError::CaseExists,
         ArbiterError::WrongJudge,
-        ArbiterError::WrongEscrow,
         ArbiterError::NoCase,
         ArbiterError::NotDirect,
     ] {

@@ -98,9 +98,8 @@ pub enum ArbiterError {
     CaseExists,
     /// The signer is not the case's judge.
     WrongJudge,
-    /// The escrow is not the case's.
-    WrongEscrow,
-    /// The case account holds no case.
+    /// The case account holds no case, which is also where a decision naming another escrow, buyer
+    /// or job reference lands.
     NoCase,
     /// Another program called `Decide`. LEZ carries a signature into every program call, so a
     /// program the judge signs for could otherwise decide the judge's cases.
@@ -118,9 +117,8 @@ impl ArbiterError {
             Self::WrongCase => 103,
             Self::CaseExists => 104,
             Self::WrongJudge => 105,
-            Self::WrongEscrow => 106,
-            Self::NoCase => 107,
-            Self::NotDirect => 108,
+            Self::NoCase => 106,
+            Self::NotDirect => 107,
         }
     }
 }
@@ -132,7 +130,6 @@ enum ToCase {
     Record(Case),
     /// The signer's decision, to check against the case and carry out.
     Decide {
-        escrow: AccountId,
         judge: AccountId,
         decision: Decision,
     },
@@ -213,7 +210,6 @@ fn on_signer(
                 arbiter,
                 &job,
                 &ToCase::Decide {
-                    escrow,
                     judge: signer,
                     decision,
                 },
@@ -246,23 +242,14 @@ fn on_case(input: &ReceiveInput, message: ToCase) -> Result<Response, ArbiterErr
                 borsh::to_vec(&case).expect("a case serializes"),
             ))
         }
-        ToCase::Decide {
-            escrow,
-            judge,
-            decision,
-        } => {
+        // The judge's actor picked this case from the escrow, buyer and job reference it was
+        // given, and a case is only ever recorded at its own job's account.
+        ToCase::Decide { judge, decision } => {
             if input.pre_state.is_empty() {
                 return Err(ArbiterError::NoCase);
             }
             let case: Case =
                 borsh::from_slice(&input.pre_state).map_err(|_| ArbiterError::NoCase)?;
-            let job = job_account_id(&case.escrow, &case.buyer, &case.job_ref);
-            if input.receiver.account_id != case_account_id(&arbiter, &job) {
-                return Err(ArbiterError::WrongCase);
-            }
-            if case.escrow != escrow {
-                return Err(ArbiterError::WrongEscrow);
-            }
             if case.judge != judge {
                 return Err(ArbiterError::WrongJudge);
             }
