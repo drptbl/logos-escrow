@@ -2,7 +2,7 @@
 //! its handler on the message LEZ delivers and writes the result.
 //!
 //! A refused call exits with the error's code instead of panicking: LEZ charges a non-zero exit
-//! only for the cycles it used.
+//! only for the cycles it used, but a panic for the transaction's whole cycle budget.
 
 use lee_core::program::{ReceiveInput, Response};
 use risc0_zkvm::guest::env;

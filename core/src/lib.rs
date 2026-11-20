@@ -20,7 +20,7 @@ use lee_core::{
     Timestamp,
     account::{AccountId, Actor, Balance},
     native_token::{Message as NativeMessage, custody_transfer},
-    program::{PdaSeed, ReceiveInput, Response, SyncMessage},
+    program::{PdaSeed, ReceiveInput, Response, SyncMessage, TimestampValidityWindow},
 };
 use risc0_zkvm::sha::{Impl, Sha256 as _};
 
@@ -200,116 +200,124 @@ fn on_party(input: &ReceiveInput, instruction: Instruction) -> Result<Response, 
         caller: input.from.map(|caller| caller.program_account_id),
         party_authorized: input.is_authorized,
     };
-    // The payee is the job's own, which only the job's actor knows; it fills it in.
-    let unknown = party;
-    let (buyer, job_ref, action) = match instruction {
-        Instruction::Open {
-            job_ref,
-            provider,
-            pay_to,
-            refund_to,
-            amount,
-            deadline,
-            controller,
-        } => {
-            let job = job_account_id(&program, &party, &job_ref);
-            if amount == 0 || provider == party || pay_to == job || refund_to == job {
-                return Err(EscrowError::InvalidTerms);
-            }
-            let record = Job {
-                buyer: party,
+    // Claim and Refund pay the record's own addresses, which only the job's actor holds: it
+    // replaces this with them.
+    let from_the_record = party;
+    // LEZ checks a deadline against the block's timestamp, which the job's actor can't do.
+    let (buyer, job_ref, action, window, funding): (_, _, _, TimestampValidityWindow, _) =
+        match instruction {
+            Instruction::Open {
+                job_ref,
                 provider,
                 pay_to,
                 refund_to,
                 amount,
-                released: 0,
-                claimed: 0,
                 deadline,
-                state: JobState::Open,
-                result: None,
                 controller,
-            };
-            return Ok(Response::keep_state()
-                .send(to_job(
-                    program,
-                    Step {
-                        buyer: party,
-                        job_ref,
-                        origin,
-                        action: Action::Open(record),
-                    },
-                ))
+            } => {
+                let job = job_account_id(&program, &party, &job_ref);
+                if amount == 0 || provider == party || pay_to == job || refund_to == job {
+                    return Err(EscrowError::InvalidTerms);
+                }
+                let record = Job {
+                    buyer: party,
+                    provider,
+                    pay_to,
+                    refund_to,
+                    amount,
+                    released: 0,
+                    claimed: 0,
+                    deadline,
+                    state: JobState::Open,
+                    result: None,
+                    controller,
+                };
                 // The buyer's own balance, which its signature authorizes.
-                .send_sync(
+                let funding = SyncMessage::new(
                     Actor::native_balance(party),
                     &NativeMessage::Transfer { to: job, amount },
+                );
+                (
+                    party,
+                    job_ref,
+                    Action::Open(record),
+                    (..deadline).into(),
+                    Some(funding),
                 )
-                .timestamp_window(..deadline));
-        }
-        Instruction::Deliver {
-            buyer,
-            job_ref,
-            result,
-            deadline,
-        } => (
-            buyer,
-            job_ref,
-            Action::Deliver {
-                provider: party,
-                deadline,
+            }
+            Instruction::Deliver {
+                buyer,
+                job_ref,
                 result,
-            },
-        ),
-        Instruction::Claim {
-            buyer,
-            job_ref,
-            amount,
-        } => (
-            buyer,
-            job_ref,
-            Action::Claim {
-                provider: party,
-                payee: unknown,
+                deadline,
+            } => (
+                buyer,
+                job_ref,
+                Action::Deliver {
+                    provider: party,
+                    deadline,
+                    result,
+                },
+                (..deadline).into(),
+                None,
+            ),
+            Instruction::Claim {
+                buyer,
+                job_ref,
                 amount,
-            },
-        ),
-        Instruction::Release { job_ref, amount } => (party, job_ref, Action::Release { amount }),
-        Instruction::Refund {
-            job_ref,
-            amount,
-            deadline,
-        } => (
-            party,
-            job_ref,
-            Action::Refund {
-                payee: unknown,
+            } => (
+                buyer,
+                job_ref,
+                Action::Claim {
+                    provider: party,
+                    payee: from_the_record,
+                    amount,
+                },
+                (..).into(),
+                None,
+            ),
+            Instruction::Release { job_ref, amount } => (
+                party,
+                job_ref,
+                Action::Release { amount },
+                (..).into(),
+                None,
+            ),
+            Instruction::Refund {
+                job_ref,
                 amount,
                 deadline,
-            },
-        ),
-        Instruction::Return { buyer, job_ref } => {
-            (buyer, job_ref, Action::Return { provider: party })
-        }
+            } => (
+                party,
+                job_ref,
+                Action::Refund {
+                    payee: from_the_record,
+                    amount,
+                    deadline,
+                },
+                (deadline..).into(),
+                None,
+            ),
+            Instruction::Return { buyer, job_ref } => (
+                buyer,
+                job_ref,
+                Action::Return { provider: party },
+                (..).into(),
+                None,
+            ),
+        };
+    let step = Step {
+        buyer,
+        job_ref,
+        origin,
+        action,
     };
-    // LEZ checks a deadline against the block's timestamp, which the job's actor can't do.
-    let window = match &action {
-        Action::Deliver { deadline, .. } => Some((None, Some(*deadline))),
-        Action::Refund { deadline, .. } => Some((Some(*deadline), None)),
-        _ => None,
-    };
-    let response = Response::keep_state().send(to_job(
-        program,
-        Step {
-            buyer,
-            job_ref,
-            origin,
-            action,
-        },
-    ));
-    Ok(match window {
-        Some((None, Some(end))) => response.timestamp_window(..end),
-        Some((Some(start), None)) => response.timestamp_window(start..),
-        _ => response,
+    let response = Response::keep_state()
+        .send(to_job(program, step))
+        .timestamp_window(window);
+    Ok(match funding {
+        Some(funding) => response.send(funding),
+        None => response,
     })
 }
 

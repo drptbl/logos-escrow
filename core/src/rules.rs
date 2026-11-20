@@ -1,5 +1,6 @@
-//! The job rules, free of LEZ's plan/apply types, so a port to another LEZ program model only
-//! rewrites the layer in `lib.rs` that feeds them.
+//! The job rules, free of LEZ's program types, so a port to another LEZ program model only
+//! rewrites the layer in `lib.rs` that feeds them, as the port from v0.3's plan/apply to v0.4's
+//! actors did.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
@@ -22,7 +23,7 @@ pub enum JobState {
     Refunded,
 }
 
-/// The job record, stored in the escrow program's shard of the job account.
+/// The job record, held by the job account's actor under the escrow program.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Job {
     pub buyer: AccountId,
