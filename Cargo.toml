@@ -2,7 +2,7 @@
 resolver = "3"
 # The CLI and the arbiter client run on LEZ v0.3.1's wallet and wait for a 0.4 chain to test
 # against (logos-devnet support, a lez_core 0.4 release), so they're out of the 0.4 workspace.
-members = ["core", "integration"]
+members = ["core", "integration", "examples/arbiter"]
 exclude = ["methods/guest", "cli", "examples/arbiter/client", "examples/arbiter/guest"]
 
 [workspace.package]

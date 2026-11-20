@@ -1,20 +1,21 @@
 //! An example escrow controller: an arbiter that lets one named judge decide a job.
 //!
-//! The buyer opens a job through the arbiter and names a judge. The arbiter records the judge in
-//! a case account derived from the job account, and opens the escrow job naming itself as the
-//! controller. From then on the judge, and only the judge, can make the arbiter release part of
-//! the deposit to the provider or return the job to the buyer. The parties still claim and refund
-//! directly on the escrow.
+//! The buyer opens a job through the arbiter and names a judge. The arbiter records the case in
+//! its own case account, derived from the job account, and opens the escrow job naming itself as
+//! the controller. From then on the judge, and only the judge, can make the arbiter release part
+//! of the deposit to the provider or return the job to the buyer. The parties still claim and
+//! refund directly on the escrow.
 //!
-//! LEZ calls a program twice: `plan` sees the accounts but no data, `apply` sees the case record.
-//! So `plan` checks the signatures and builds the escrow call, and `apply` checks the case.
-//! A failed `apply` fails the whole transaction, escrow call included.
+//! LEZ v0.4 delivers each message to one actor. The buyer's `Open` and the judge's `Decide` reach
+//! their own actors under the arbiter, where `is_authorized` says whether they signed. Those
+//! actors pass the case on to the case's actor, which only the arbiter itself can reach, and which
+//! calls the escrow. A refusal anywhere fails the whole transaction, escrow call included.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
     Timestamp,
-    account::{AccountId, Balance, ProgramShardSelector, ShardData},
-    program::{AccountMeta, ApplyInput, ChainedCall, PdaSeed, Plan, PlanInput},
+    account::{AccountId, Actor, Balance},
+    program::{PdaSeed, ReceiveInput, Response, SyncMessage},
 };
 use logos_escrow_core::{Hash32, Instruction as EscrowInstruction, job_account_id};
 use risc0_zkvm::sha::{Impl, Sha256 as _};
@@ -44,8 +45,7 @@ fn case_seed(job: &AccountId) -> PdaSeed {
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum ArbiterInstruction {
     /// Opens an escrow job with this arbiter as its controller and `judge` deciding it. The other
-    /// fields are the escrow's `Open`.
-    /// Accounts: `[buyer (signs), case, job]`.
+    /// fields are the escrow's `Open`. To `Actor(buyer, arbiter)`, signed by the buyer.
     Open {
         escrow: AccountId,
         judge: AccountId,
@@ -56,20 +56,20 @@ pub enum ArbiterInstruction {
         amount: Balance,
         deadline: Timestamp,
     },
-    /// The judge's decision on a job, sent by the judge directly.
-    /// Accounts: `[judge (signs), case, party, job]`, where the party is the buyer for a
-    /// release and the provider for a return.
+    /// The judge's decision on the job of `buyer` and `job_ref`. To `Actor(judge, arbiter)`,
+    /// signed by the judge, as a direct call.
     Decide {
         escrow: AccountId,
+        buyer: AccountId,
+        job_ref: Hash32,
         decision: Decision,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Decision {
-    /// Lets the provider claim `amount` more. `job_ref` is the job's, which the escrow's
-    /// `Release` checks against the buyer and the job account.
-    Release { job_ref: Hash32, amount: Balance },
+    /// Lets the provider claim `amount` more.
+    Release { amount: Balance },
     /// Gives what was never released back to the buyer.
     Return,
 }
@@ -79,17 +79,20 @@ pub enum Decision {
 pub struct Case {
     pub escrow: AccountId,
     pub judge: AccountId,
+    pub buyer: AccountId,
+    pub provider: AccountId,
+    pub job_ref: Hash32,
 }
 
 /// Why the arbiter refused a call. The guest exits with [`ArbiterError::code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbiterError {
-    /// The instruction data or the account list does not decode.
+    /// The message does not decode.
     InvalidInstruction,
     /// The buyer or the judge did not sign.
     Unauthorized,
-    /// The case account is not the one derived from the job account, or at `Open` the job
-    /// account is not the escrow's for the buyer and the job reference.
+    /// The case account is not the one derived from the escrow's job account for the buyer and
+    /// the job reference.
     WrongCase,
     /// `Open` found a case already.
     CaseExists,
@@ -99,7 +102,7 @@ pub enum ArbiterError {
     WrongEscrow,
     /// The case account holds no case.
     NoCase,
-    /// Another program called `Decide`. LEZ carries a signature into every chained call, so a
+    /// Another program called `Decide`. LEZ carries a signature into every program call, so a
     /// program the judge signs for could otherwise decide the judge's cases.
     NotDirect,
 }
@@ -122,18 +125,42 @@ impl ArbiterError {
     }
 }
 
-/// What `apply` checks against, or writes to, the case record.
+/// What the arbiter's own actors pass to a case's actor. Only the arbiter sends it.
 #[derive(BorshSerialize, BorshDeserialize)]
-enum Effect {
-    Open(Case),
-    Decide(Case),
+enum ToCase {
+    /// Records a new case.
+    Record(Case),
+    /// The signer's decision, to check against the case and carry out.
+    Decide {
+        escrow: AccountId,
+        judge: AccountId,
+        decision: Decision,
+    },
 }
 
-/// Checks the signer and the case account, and builds the escrow call.
-pub fn plan(input: &PlanInput) -> Result<Plan, ArbiterError> {
-    let instruction: ArbiterInstruction =
-        borsh::from_slice(&input.instruction_data).map_err(|_| ArbiterError::InvalidInstruction)?;
-    let mut plan = Plan::new(input);
+/// Handles one message to one of the arbiter's actors.
+pub fn handle(input: &ReceiveInput) -> Result<Response, ArbiterError> {
+    if input.from_own_program() {
+        let message =
+            borsh::from_slice(&input.message).map_err(|_| ArbiterError::InvalidInstruction)?;
+        on_case(input, message)
+    } else {
+        let instruction =
+            borsh::from_slice(&input.message).map_err(|_| ArbiterError::InvalidInstruction)?;
+        on_signer(input, instruction)
+    }
+}
+
+/// The buyer's `Open` or the judge's `Decide`, at the signer's own actor.
+fn on_signer(
+    input: &ReceiveInput,
+    instruction: ArbiterInstruction,
+) -> Result<Response, ArbiterError> {
+    let arbiter = input.receiver.program_account_id;
+    let signer = input.receiver.account_id;
+    if !input.is_authorized {
+        return Err(ArbiterError::Unauthorized);
+    }
     match instruction {
         ArbiterInstruction::Open {
             escrow,
@@ -145,124 +172,117 @@ pub fn plan(input: &PlanInput) -> Result<Plan, ArbiterError> {
             amount,
             deadline,
         } => {
-            let [buyer, case, job] = accounts(input)?;
-            signed(buyer)?;
             // Only the escrow's own job account for this buyer gets a case, so nobody can take
             // the case of someone else's job through an escrow of their own.
-            if job.account_id != job_account_id(&escrow, &buyer.account_id, &job_ref) {
-                return Err(ArbiterError::WrongCase);
-            }
-            own_case(input, case, job)?;
-            plan.effect(case, &Effect::Open(Case { escrow, judge }));
+            let job = job_account_id(&escrow, &signer, &job_ref);
+            let case = Case {
+                escrow,
+                judge,
+                buyer: signer,
+                provider,
+                job_ref,
+            };
             // The buyer's signature carries into this call, and the escrow takes it only because
             // the job names this program, the caller, as its controller.
-            plan.call(escrow_call(
-                escrow,
-                &[buyer, job],
-                &EscrowInstruction::Open {
-                    job_ref,
-                    provider,
-                    pay_to,
-                    refund_to,
-                    amount,
-                    deadline,
-                    controller: Some(input.self_account_id),
-                },
-            ));
+            Ok(Response::keep_state()
+                .send(to_case(arbiter, &job, &ToCase::Record(case)))
+                .send_sync(
+                    Actor::new(signer, escrow),
+                    &EscrowInstruction::Open {
+                        job_ref,
+                        provider,
+                        pay_to,
+                        refund_to,
+                        amount,
+                        deadline,
+                        controller: Some(arbiter),
+                    },
+                ))
         }
-        ArbiterInstruction::Decide { escrow, decision } => {
-            if input.caller_account_id.is_some() {
+        ArbiterInstruction::Decide {
+            escrow,
+            buyer,
+            job_ref,
+            decision,
+        } => {
+            if input.from.is_some() {
                 return Err(ArbiterError::NotDirect);
             }
-            let [judge, case, party, job] = accounts(input)?;
-            signed(judge)?;
-            own_case(input, case, job)?;
-            plan.effect(
-                case,
-                &Effect::Decide(Case {
+            let job = job_account_id(&escrow, &buyer, &job_ref);
+            Ok(Response::keep_state().send(to_case(
+                arbiter,
+                &job,
+                &ToCase::Decide {
                     escrow,
-                    judge: judge.account_id,
-                }),
-            );
-            let instruction = match decision {
-                Decision::Release { job_ref, amount } => {
-                    EscrowInstruction::Release { job_ref, amount }
-                }
-                Decision::Return => EscrowInstruction::Return,
-            };
-            plan.call(escrow_call(escrow, &[party, job], &instruction));
+                    judge: signer,
+                    decision,
+                },
+            )))
         }
     }
-    Ok(plan)
 }
 
-/// Writes a new case, or checks a decision against the stored one and keeps it.
-pub fn apply(input: &ApplyInput) -> Result<ShardData, ArbiterError> {
-    let effect: Effect =
-        borsh::from_slice(&input.effect_data).map_err(|_| ArbiterError::InvalidInstruction)?;
-    match effect {
-        Effect::Open(case) => {
-            if !input.pre_data.is_empty() {
+/// A message to the case of `job`, with the case's seed: LEZ admits a fresh public account only
+/// for the program whose PDA it is.
+fn to_case(arbiter: AccountId, job: &AccountId, message: &ToCase) -> SyncMessage {
+    SyncMessage::new(Actor::new(case_account_id(&arbiter, job), arbiter), message)
+        .with_pda_seeds([case_seed(job)])
+}
+
+/// A message at a case's actor: records the case, or checks a decision against it and calls the
+/// escrow.
+fn on_case(input: &ReceiveInput, message: ToCase) -> Result<Response, ArbiterError> {
+    let arbiter = input.receiver.program_account_id;
+    match message {
+        ToCase::Record(case) => {
+            let job = job_account_id(&case.escrow, &case.buyer, &case.job_ref);
+            if input.receiver.account_id != case_account_id(&arbiter, &job) {
+                return Err(ArbiterError::WrongCase);
+            }
+            if !input.pre_state.is_empty() {
                 return Err(ArbiterError::CaseExists);
             }
-            Ok(
-                ShardData::try_from(borsh::to_vec(&case).expect("a case serializes"))
-                    .expect("a case fits in a shard"),
-            )
+            Ok(Response::set_state(
+                borsh::to_vec(&case).expect("a case serializes"),
+            ))
         }
-        Effect::Decide(asked) => {
-            if input.pre_data.is_empty() {
+        ToCase::Decide {
+            escrow,
+            judge,
+            decision,
+        } => {
+            if input.pre_state.is_empty() {
                 return Err(ArbiterError::NoCase);
             }
-            let stored: Case =
-                borsh::from_slice(&input.pre_data).map_err(|_| ArbiterError::NoCase)?;
-            if stored.escrow != asked.escrow {
+            let case: Case =
+                borsh::from_slice(&input.pre_state).map_err(|_| ArbiterError::NoCase)?;
+            let job = job_account_id(&case.escrow, &case.buyer, &case.job_ref);
+            if input.receiver.account_id != case_account_id(&arbiter, &job) {
+                return Err(ArbiterError::WrongCase);
+            }
+            if case.escrow != escrow {
                 return Err(ArbiterError::WrongEscrow);
             }
-            if stored.judge != asked.judge {
+            if case.judge != judge {
                 return Err(ArbiterError::WrongJudge);
             }
-            Ok(input.pre_data.clone())
+            let (party, instruction) = match decision {
+                Decision::Release { amount } => (
+                    case.buyer,
+                    EscrowInstruction::Release {
+                        job_ref: case.job_ref,
+                        amount,
+                    },
+                ),
+                Decision::Return => (
+                    case.provider,
+                    EscrowInstruction::Return {
+                        buyer: case.buyer,
+                        job_ref: case.job_ref,
+                    },
+                ),
+            };
+            Ok(Response::keep_state().send_sync(Actor::new(party, case.escrow), &instruction))
         }
     }
-}
-
-fn accounts<const N: usize>(input: &PlanInput) -> Result<&[AccountMeta; N], ArbiterError> {
-    <&[AccountMeta; N]>::try_from(input.accounts.as_slice())
-        .map_err(|_| ArbiterError::InvalidInstruction)
-}
-
-fn signed(account: &AccountMeta) -> Result<(), ArbiterError> {
-    if account.is_authorized {
-        Ok(())
-    } else {
-        Err(ArbiterError::Unauthorized)
-    }
-}
-
-/// Checks that `case` is the case account of `job`, selecting this program's shard.
-fn own_case(input: &PlanInput, case: &AccountMeta, job: &AccountMeta) -> Result<(), ArbiterError> {
-    if case.program_account_id == input.self_account_id
-        && case.account_id == case_account_id(&input.self_account_id, &job.account_id)
-    {
-        Ok(())
-    } else {
-        Err(ArbiterError::WrongCase)
-    }
-}
-
-/// A call to the escrow naming `accounts`, each selecting the escrow's shard.
-fn escrow_call(
-    escrow: AccountId,
-    accounts: &[&AccountMeta],
-    instruction: &EscrowInstruction,
-) -> ChainedCall {
-    ChainedCall::new(
-        escrow,
-        accounts
-            .iter()
-            .map(|account| ProgramShardSelector::new(account.account_id, escrow))
-            .collect(),
-        instruction,
-    )
 }

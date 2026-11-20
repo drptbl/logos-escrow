@@ -16,6 +16,7 @@ use lee_core::{
     native_token::Message as NativeMessage,
     program::PdaSeed,
 };
+use logos_escrow_arbiter::{ArbiterError, ArbiterInstruction, Decision, case_account_id};
 use logos_escrow_core::{EscrowError, Instruction, Job, JobState, job_account_id};
 
 const GUEST: &str = concat!(
@@ -27,9 +28,15 @@ const CONTROLLER_GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../methods/guest/target/riscv32im-risc0-zkvm-elf/docker/test_controller.bin"
 );
+/// The example arbiter controller.
+const ARBITER_GUEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../examples/arbiter/guest/target/riscv32im-risc0-zkvm-elf/docker/example_arbiter.bin"
+);
 /// Where the test deploys the escrow program; on chain this is the header account.
 const PROGRAM: AccountId = AccountId::new([0xE5; 32]);
 const CONTROLLER: AccountId = AccountId::new([0xC0; 32]);
+const ARBITER: AccountId = AccountId::new([0xA7; 32]);
 const JOB_REF: [u8; 32] = [9; 32];
 const AMOUNT: Balance = 500;
 const START: Balance = 10_000;
@@ -109,7 +116,11 @@ impl Chain {
                 (provider().id, START),
                 (operator().id, START),
             ])
-            .with_named_programs([(PROGRAM, load(GUEST)), (CONTROLLER, load(CONTROLLER_GUEST))]);
+            .with_named_programs([
+                (PROGRAM, load(GUEST)),
+                (CONTROLLER, load(CONTROLLER_GUEST)),
+                (ARBITER, load(ARBITER_GUEST)),
+            ]);
         Self { state, block: 1 }
     }
 
@@ -659,4 +670,102 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
         .expect("the treasury refunds through the controller");
     assert_eq!(chain.balance(refund_to().id), AMOUNT);
     assert_eq!(chain.balance(job), 0);
+}
+
+fn case() -> AccountId {
+    case_account_id(&ARBITER, &job())
+}
+
+/// One call to the example arbiter from `signer`'s own actor, declaring the case, the job and
+/// `more`.
+fn arbiter(
+    chain: &mut Chain,
+    signer: &Party,
+    instruction: &ArbiterInstruction,
+    more: &[Actor],
+) -> Result<(), LeeError> {
+    let root = Actor::new(signer.id, ARBITER);
+    let mut actors = vec![root, Actor::new(case(), ARBITER), escrow(job())];
+    actors.extend_from_slice(more);
+    chain.send(signer, root, &actors, Vec::new(), instruction, BEFORE)
+}
+
+/// The buyer opens a job through the example arbiter, which records the operator as its judge.
+fn open_with_judge(chain: &mut Chain) {
+    let open = ArbiterInstruction::Open {
+        escrow: PROGRAM,
+        judge: operator().id,
+        job_ref: JOB_REF,
+        provider: provider().id,
+        pay_to: pay_to().id,
+        refund_to: refund_to().id,
+        amount: AMOUNT,
+        deadline: DEADLINE,
+    };
+    arbiter(
+        chain,
+        &buyer(),
+        &open,
+        &[escrow(buyer().id), native(buyer().id), native(job())],
+    )
+    .expect("open through the arbiter");
+}
+
+fn decide(decision: Decision) -> ArbiterInstruction {
+    ArbiterInstruction::Decide {
+        escrow: PROGRAM,
+        buyer: buyer().id,
+        job_ref: JOB_REF,
+        decision,
+    }
+}
+
+#[test]
+fn the_arbiters_judge_pays_part_and_returns_the_rest() {
+    let mut chain = Chain::new();
+    open_with_judge(&mut chain);
+    assert_eq!(chain.job().controller, Some(ARBITER));
+    assert_eq!(chain.balance(job()), AMOUNT);
+
+    arbiter(
+        &mut chain,
+        &operator(),
+        &decide(Decision::Release { amount: 200 }),
+        &[escrow(buyer().id)],
+    )
+    .expect("the judge releases part");
+    arbiter(
+        &mut chain,
+        &operator(),
+        &decide(Decision::Return),
+        &[escrow(provider().id)],
+    )
+    .expect("the judge returns the rest");
+    assert_eq!(chain.job().state, JobState::Returned);
+
+    chain.claim_of(200).expect("the provider claims its part");
+    chain
+        .refund(AMOUNT - 200, 0, BEFORE)
+        .expect("the buyer refunds the rest");
+    assert_eq!(chain.balance(pay_to().id), 200);
+    assert_eq!(chain.balance(refund_to().id), AMOUNT - 200);
+}
+
+#[test]
+fn only_the_cases_judge_decides() {
+    let mut chain = Chain::new();
+    open_with_judge(&mut chain);
+    // The provider signs a decision in its own favour.
+    let result = arbiter(
+        &mut chain,
+        &provider(),
+        &decide(Decision::Release { amount: AMOUNT }),
+        &[escrow(buyer().id)],
+    );
+    assert!(
+        matches!(&result, Err(LeeError::ProgramExitedWithCode { code, .. })
+            if *code == u32::from(ArbiterError::WrongJudge.code())),
+        "{result:?}"
+    );
+    assert_eq!(chain.job().released, 0);
 }
