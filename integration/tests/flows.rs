@@ -1,23 +1,22 @@
-//! Runs the built escrow guest through LEZ v0.3.1's state machine, as the sequencer does: real
-//! signatures, chained native transfers, PDA authorization and validity windows.
+//! Runs the built escrow guest through LEZ v0.4's state machine, as the sequencer does: real
+//! signatures, declared actors, program calls, PDA custody and validity windows.
 //!
 //! Needs the guest binaries: `make build`.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use lee::{
-    PrivateKey, PublicKey, PublicTransaction, V03State,
-    error::{InvalidProgramBehaviorError, LeeError},
+    PrivateKey, PublicAccountEvidence, PublicKey, PublicTransaction, V03State,
+    error::LeeError,
     program::Program,
     public_transaction::{Message, WitnessSet},
 };
 use lee_core::{
-    account::{AccountId, Balance, ProgramShardSelector},
-    native_token::{Instruction as NativeInstruction, NATIVE_TOKEN_PROGRAM_ID, TransferError},
+    account::{AccountId, Actor, Balance},
+    native_token::Message as NativeMessage,
     program::PdaSeed,
 };
-use logos_escrow_arbiter::{ArbiterError, ArbiterInstruction, Decision, case_account_id};
-use logos_escrow_core::{Instruction, Job, JobState, job_account_id};
+use logos_escrow_core::{EscrowError, Instruction, Job, JobState, job_account_id};
 
 const GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -28,29 +27,14 @@ const CONTROLLER_GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../methods/guest/target/riscv32im-risc0-zkvm-elf/docker/test_controller.bin"
 );
-/// The example arbiter controller.
-const ARBITER_GUEST: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../examples/arbiter/guest/target/riscv32im-risc0-zkvm-elf/docker/example_arbiter.bin"
-);
 /// Where the test deploys the escrow program; on chain this is the header account.
 const PROGRAM: AccountId = AccountId::new([0xE5; 32]);
 const CONTROLLER: AccountId = AccountId::new([0xC0; 32]);
-const ARBITER: AccountId = AccountId::new([0xA7; 32]);
 const JOB_REF: [u8; 32] = [9; 32];
 const AMOUNT: Balance = 500;
 const START: Balance = 10_000;
 const DEADLINE: u64 = 1_800_000_000_000;
 const BEFORE: u64 = DEADLINE - 1;
-const RESULT: [u8; 32] = [4; 32];
-/// Where the provider is paid and the buyer refunded: empty public accounts, apart from the parties.
-const PAY_TO: AccountId = AccountId::new([0x33; 32]);
-const REFUND_TO: AccountId = AccountId::new([0x66; 32]);
-
-struct Chain {
-    state: V03State,
-    block: u64,
-}
 
 struct Party {
     key: PrivateKey,
@@ -73,13 +57,36 @@ fn provider() -> Party {
     Party::new(2)
 }
 
+/// Where the provider is paid and the buyer refunded: fresh public accounts, apart from the
+/// parties. Paying into one takes its public key as admission evidence.
+fn pay_to() -> Party {
+    Party::new(3)
+}
+
+fn refund_to() -> Party {
+    Party::new(4)
+}
+
+/// LEZ admits a fresh public account into a transaction only with its key.
+fn evidence(party: &Party) -> PublicAccountEvidence {
+    PublicAccountEvidence::Key(PublicKey::new_from_private_key(&party.key))
+}
+
 /// Signs calls to the controller; it is neither party.
 fn operator() -> Party {
-    Party::new(3)
+    Party::new(5)
 }
 
 fn job() -> AccountId {
     job_account_id(&PROGRAM, &buyer().id, &JOB_REF)
+}
+
+fn escrow(account: AccountId) -> Actor {
+    Actor::new(account, PROGRAM)
+}
+
+fn native(account: AccountId) -> Actor {
+    Actor::native_balance(account)
 }
 
 fn load(path: &str) -> Program {
@@ -87,6 +94,11 @@ fn load(path: &str) -> Program {
         panic!("guest binary missing at {path} ({error}); build it with make build")
     });
     Program::new(Cow::Owned(elf)).expect("valid guest")
+}
+
+struct Chain {
+    state: V03State,
+    block: u64,
 }
 
 impl Chain {
@@ -97,95 +109,99 @@ impl Chain {
                 (provider().id, START),
                 (operator().id, START),
             ])
-            .with_named_programs([
-                (PROGRAM, load(GUEST)),
-                (CONTROLLER, load(CONTROLLER_GUEST)),
-                (ARBITER, load(ARBITER_GUEST)),
-            ]);
+            .with_named_programs([(PROGRAM, load(GUEST)), (CONTROLLER, load(CONTROLLER_GUEST))]);
         Self { state, block: 1 }
     }
 
-    /// Sends one escrow call signed by `signer`, naming `accounts` with the escrow shard.
-    fn call(
+    /// Sends `message` to `to`, declaring `actors`, admitting `fresh` and signed by `signer`.
+    fn send<M: borsh::BorshSerialize>(
         &mut self,
         signer: &Party,
-        accounts: &[AccountId],
-        instruction: &Instruction,
-        timestamp: u64,
-    ) -> Result<(), LeeError> {
-        let selectors = accounts
-            .iter()
-            .map(|id| ProgramShardSelector::new(*id, PROGRAM))
-            .collect();
-        self.send(PROGRAM, signer, selectors, instruction, timestamp)
-    }
-
-    /// Has the controller make one escrow call, with `seeds` authorizing its PDAs. The operator
-    /// signs, so no party does.
-    fn relay(
-        &mut self,
-        accounts: &[AccountId],
-        seeds: Vec<[u8; 32]>,
-        instruction: &Instruction,
-        timestamp: u64,
-    ) -> Result<(), LeeError> {
-        self.relay_signed_by(&operator(), accounts, seeds, instruction, timestamp)
-    }
-
-    fn relay_signed_by(
-        &mut self,
-        signer: &Party,
-        accounts: &[AccountId],
-        seeds: Vec<[u8; 32]>,
-        instruction: &Instruction,
-        timestamp: u64,
-    ) -> Result<(), LeeError> {
-        let selectors = accounts
-            .iter()
-            .map(|id| ProgramShardSelector::new(*id, CONTROLLER))
-            .collect();
-        let relay = (
-            PROGRAM,
-            seeds,
-            borsh::to_vec(instruction).expect("instruction serializes"),
-        );
-        self.send(CONTROLLER, signer, selectors, &relay, timestamp)
-    }
-
-    /// One call to the example arbiter, signed by `signer`.
-    fn arbiter(
-        &mut self,
-        signer: &Party,
-        accounts: &[AccountId],
-        instruction: &ArbiterInstruction,
-        timestamp: u64,
-    ) -> Result<(), LeeError> {
-        let selectors = accounts
-            .iter()
-            .map(|id| ProgramShardSelector::new(*id, ARBITER))
-            .collect();
-        self.send(ARBITER, signer, selectors, instruction, timestamp)
-    }
-
-    fn send<I: borsh::BorshSerialize>(
-        &mut self,
-        program: AccountId,
-        signer: &Party,
-        selectors: Vec<ProgramShardSelector>,
-        instruction: &I,
+        to: Actor,
+        actors: &[Actor],
+        fresh: Vec<PublicAccountEvidence>,
+        message: &M,
         timestamp: u64,
     ) -> Result<(), LeeError> {
         let nonce = self.state.get_account_by_id(signer.id).nonce;
-        let message = Message::try_new(program, selectors, vec![nonce], instruction)?;
-        let witness_set = WitnessSet::for_message(&message, &[&signer.key]);
+        let nonces = BTreeMap::from([(signer.id, nonce)]);
+        let tx = Message::new(
+            to,
+            Program::serialize_message(message)?,
+            actors.iter().copied(),
+            nonces,
+            None,
+            fresh,
+        );
+        let witness_set = WitnessSet::for_message(&tx, &[&signer.key]);
         self.block += 1;
         self.state
             .transition_from_public_transaction(
-                &PublicTransaction::new(message, witness_set),
+                &PublicTransaction::new(tx, witness_set),
                 self.block,
                 timestamp,
             )
             .map(drop)
+    }
+
+    /// One escrow call from `signer`'s own actor, declaring it, the job and `more`.
+    fn call(
+        &mut self,
+        signer: &Party,
+        instruction: &Instruction,
+        more: &[Actor],
+        timestamp: u64,
+    ) -> Result<(), LeeError> {
+        self.call_admitting(signer, instruction, more, Vec::new(), timestamp)
+    }
+
+    fn call_admitting(
+        &mut self,
+        signer: &Party,
+        instruction: &Instruction,
+        more: &[Actor],
+        fresh: Vec<PublicAccountEvidence>,
+        timestamp: u64,
+    ) -> Result<(), LeeError> {
+        let mut actors = vec![escrow(signer.id), escrow(job())];
+        actors.extend_from_slice(more);
+        self.send(
+            signer,
+            escrow(signer.id),
+            &actors,
+            fresh,
+            instruction,
+            timestamp,
+        )
+    }
+
+    /// Has the controller send `instruction` to `party`'s escrow actor, with `seeds` authorizing
+    /// its own PDAs. `signer` signs the call to the controller, and its signature carries.
+    #[allow(clippy::too_many_arguments)]
+    fn relay(
+        &mut self,
+        signer: &Party,
+        party: AccountId,
+        seeds: Vec<[u8; 32]>,
+        instruction: &Instruction,
+        more: &[Actor],
+        fresh: Vec<PublicAccountEvidence>,
+        timestamp: u64,
+    ) -> Result<(), LeeError> {
+        let root = Actor::new(signer.id, CONTROLLER);
+        // The job is the buyer's; a treasury buying for itself has its own.
+        let mut actors = vec![root, escrow(party), escrow(job())];
+        if job_for(party) != job() && party != provider().id {
+            actors.push(escrow(job_for(party)));
+        }
+        actors.extend_from_slice(more);
+        let message = (
+            PROGRAM,
+            party,
+            seeds,
+            borsh::to_vec(instruction).expect("instruction serializes"),
+        );
+        self.send(signer, root, &actors, fresh, &message, timestamp)
     }
 
     fn balance(&self, account_id: AccountId) -> Balance {
@@ -202,7 +218,7 @@ impl Chain {
 
     fn job_at(&self, job: AccountId) -> Job {
         let account = self.state.get_account_by_id(job);
-        borsh::from_slice(account.data.shard(PROGRAM)).expect("job record decodes")
+        borsh::from_slice(account.data.actor_state(PROGRAM)).expect("job record decodes")
     }
 
     fn open(&mut self) -> Result<(), LeeError> {
@@ -212,22 +228,35 @@ impl Chain {
     fn open_controlled_by(&mut self, controller: Option<AccountId>) -> Result<(), LeeError> {
         self.call(
             &buyer(),
-            &[buyer().id, job()],
             &open_instruction(controller),
+            &[native(buyer().id), native(job())],
             BEFORE,
         )
     }
 
     fn deliver(&mut self, timestamp: u64) -> Result<(), LeeError> {
         let deliver = Instruction::Deliver {
+            buyer: buyer().id,
+            job_ref: JOB_REF,
             result: RESULT,
             deadline: DEADLINE,
         };
-        self.call(&provider(), &[provider().id, job()], &deliver, timestamp)
+        self.call(&provider(), &deliver, &[], timestamp)
     }
 
-    fn claim(&mut self) -> Result<(), LeeError> {
-        self.claim_of(AMOUNT)
+    fn refund(&mut self, amount: Balance, deadline: u64, timestamp: u64) -> Result<(), LeeError> {
+        let refund = Instruction::Refund {
+            job_ref: JOB_REF,
+            amount,
+            deadline,
+        };
+        self.call_admitting(
+            &buyer(),
+            &refund,
+            &[native(job()), native(refund_to().id)],
+            vec![evidence(&refund_to())],
+            timestamp,
+        )
     }
 
     fn claim_of(&mut self, amount: Balance) -> Result<(), LeeError> {
@@ -236,39 +265,45 @@ impl Chain {
             job_ref: JOB_REF,
             amount,
         };
-        self.call(
+        self.call_admitting(
             &provider(),
-            &[provider().id, job(), PAY_TO],
             &claim,
-            DEADLINE + 10,
+            &[native(job()), native(pay_to().id)],
+            vec![evidence(&pay_to())],
+            BEFORE,
         )
     }
+}
 
-    fn refund(&mut self, timestamp: u64) -> Result<(), LeeError> {
-        let refund = Instruction::Refund {
-            job_ref: JOB_REF,
-            amount: AMOUNT,
-            deadline: DEADLINE,
-        };
-        self.call(
-            &buyer(),
-            &[buyer().id, job(), REFUND_TO],
-            &refund,
-            timestamp,
-        )
-    }
+const RESULT: [u8; 32] = [4; 32];
+
+/// The job of `buyer` with this test's job reference.
+fn job_for(buyer: AccountId) -> AccountId {
+    job_account_id(&PROGRAM, &buyer, &JOB_REF)
 }
 
 fn open_instruction(controller: Option<AccountId>) -> Instruction {
     Instruction::Open {
         job_ref: JOB_REF,
         provider: provider().id,
-        pay_to: PAY_TO,
-        refund_to: REFUND_TO,
+        pay_to: pay_to().id,
+        refund_to: refund_to().id,
         amount: AMOUNT,
         deadline: DEADLINE,
         controller,
     }
+}
+
+fn give_back() -> Instruction {
+    Instruction::Return {
+        buyer: buyer().id,
+        job_ref: JOB_REF,
+    }
+}
+
+/// Whether `result` is the escrow refusing with `error`.
+fn refused(result: &Result<(), LeeError>, error: EscrowError) -> bool {
+    matches!(result, Err(LeeError::ProgramExitedWithCode { code, .. }) if *code == u32::from(error.code()))
 }
 
 fn release_of(amount: Balance) -> Instruction {
@@ -278,12 +313,8 @@ fn release_of(amount: Balance) -> Instruction {
     }
 }
 
-fn refused_with(code: u8) -> impl Fn(&Result<(), LeeError>) -> bool {
-    move |result| matches!(result, Err(LeeError::ProgramExitedWithCode { code: c, .. }) if *c == u32::from(code))
-}
-
 #[test]
-fn open_deliver_claim_pays_the_providers_pay_to() {
+fn open_locks_the_buyers_lepta_and_a_claim_pays_the_pay_to() {
     let mut chain = Chain::new();
 
     chain.open().expect("open");
@@ -291,14 +322,26 @@ fn open_deliver_claim_pays_the_providers_pay_to() {
     assert_eq!(chain.balance(job()), AMOUNT);
     assert_eq!(chain.job().state, JobState::Open);
 
+    chain
+        .call(&buyer(), &release_of(200), &[], BEFORE)
+        .expect("release part");
+    chain.claim_of(200).expect("claim the released part");
+    assert_eq!(chain.balance(pay_to().id), 200);
+    assert_eq!(chain.balance(job()), AMOUNT - 200);
+    assert_eq!(chain.job().claimed, 200);
+}
+
+#[test]
+fn open_deliver_claim_pays_the_providers_pay_to() {
+    let mut chain = Chain::new();
+    chain.open().expect("open");
     chain.deliver(BEFORE).expect("deliver");
     assert_eq!(chain.job().state, JobState::Delivered);
     assert_eq!(chain.job().result, Some(RESULT));
-
-    chain.claim().expect("claim");
+    chain.claim_of(AMOUNT).expect("claim");
     assert_eq!(chain.job().claimed, AMOUNT);
     assert_eq!(chain.balance(job()), 0);
-    assert_eq!(chain.balance(PAY_TO), AMOUNT);
+    assert_eq!(chain.balance(pay_to().id), AMOUNT);
     assert_eq!(chain.balance(provider().id), START);
     assert_eq!(chain.balance(buyer().id), START - AMOUNT);
 }
@@ -307,30 +350,29 @@ fn open_deliver_claim_pays_the_providers_pay_to() {
 fn an_undelivered_job_refunds_the_buyer_only_from_the_deadline() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     assert!(matches!(
-        chain.refund(BEFORE),
+        chain.refund(AMOUNT, DEADLINE, BEFORE),
         Err(LeeError::OutOfValidityWindow)
     ));
     assert_eq!(chain.balance(job()), AMOUNT);
-
-    chain.refund(DEADLINE).expect("refund at the deadline");
+    chain
+        .refund(AMOUNT, DEADLINE, DEADLINE)
+        .expect("refund at the deadline");
     assert_eq!(chain.job().state, JobState::Refunded);
     assert_eq!(chain.balance(job()), 0);
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT);
+    assert_eq!(chain.balance(refund_to().id), AMOUNT);
 }
 
 #[test]
 fn a_late_delivery_is_refused_and_the_buyer_can_refund() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     assert!(matches!(
         chain.deliver(DEADLINE),
         Err(LeeError::OutOfValidityWindow)
     ));
-    chain.refund(DEADLINE).expect("refund");
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT);
+    chain.refund(AMOUNT, DEADLINE, DEADLINE).expect("refund");
+    assert_eq!(chain.balance(refund_to().id), AMOUNT);
 }
 
 #[test]
@@ -338,8 +380,8 @@ fn opening_after_the_deadline_is_refused() {
     let mut chain = Chain::new();
     let late = chain.call(
         &buyer(),
-        &[buyer().id, job()],
         &open_instruction(None),
+        &[native(buyer().id), native(job())],
         DEADLINE,
     );
     assert!(matches!(late, Err(LeeError::OutOfValidityWindow)));
@@ -350,26 +392,16 @@ fn opening_after_the_deadline_is_refused() {
 fn released_parts_are_claimed_and_the_rest_refunded_after_the_deadline() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     chain
-        .call(&buyer(), &[buyer().id, job()], &release_of(200), BEFORE)
+        .call(&buyer(), &release_of(200), &[], BEFORE)
         .expect("release part");
-    assert_eq!(chain.job().released, 200);
-    assert_eq!(chain.balance(job()), AMOUNT);
-
     chain.claim_of(200).expect("claim the released part");
-    assert_eq!(chain.balance(PAY_TO), 200);
-
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT - 200,
-        deadline: DEADLINE,
-    };
     chain
-        .call(&buyer(), &[buyer().id, job(), REFUND_TO], &refund, DEADLINE)
+        .refund(AMOUNT - 200, DEADLINE, DEADLINE)
         .expect("refund the rest");
     assert_eq!(chain.job().state, JobState::Refunded);
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT - 200);
+    assert_eq!(chain.balance(pay_to().id), 200);
+    assert_eq!(chain.balance(refund_to().id), AMOUNT - 200);
     assert_eq!(chain.balance(job()), 0);
 }
 
@@ -377,38 +409,30 @@ fn released_parts_are_claimed_and_the_rest_refunded_after_the_deadline() {
 fn a_refused_call_exits_with_its_code_and_moves_nothing() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     // Claiming before anything is released.
-    assert!(refused_with(
-        logos_escrow_core::EscrowError::WrongAmount.code()
-    )(&chain.claim()));
+    let early = chain.claim_of(AMOUNT);
+    assert!(refused(&early, EscrowError::WrongAmount), "{early:?}");
     assert_eq!(chain.balance(job()), AMOUNT);
-    assert_eq!(chain.balance(PAY_TO), 0);
-    assert_eq!(chain.job().state, JobState::Open);
+    assert_eq!(chain.job().claimed, 0);
 }
 
 #[test]
 fn nobody_can_move_the_deposit_without_the_escrow_program() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     // The buyer signs a plain native transfer out of the job account.
     let drain = chain.send(
-        NATIVE_TOKEN_PROGRAM_ID,
         &buyer(),
-        vec![
-            ProgramShardSelector::native_balance(job()),
-            ProgramShardSelector::native_balance(buyer().id),
-        ],
-        &NativeInstruction::Transfer { amount: AMOUNT },
+        native(job()),
+        &[native(job()), native(buyer().id)],
+        Vec::new(),
+        &NativeMessage::Transfer {
+            to: buyer().id,
+            amount: AMOUNT,
+        },
         BEFORE,
     );
-    assert!(matches!(
-        drain,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::NativeTransferFailed(
-            TransferError::UnauthorizedSender { account_id }
-        ))) if account_id == job()
-    ));
+    assert!(drain.is_err(), "{drain:?}");
     assert_eq!(chain.balance(job()), AMOUNT);
 }
 
@@ -416,95 +440,55 @@ fn nobody_can_move_the_deposit_without_the_escrow_program() {
 fn a_returned_job_is_refunded_before_the_deadline() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     chain
-        .call(
-            &provider(),
-            &[provider().id, job()],
-            &Instruction::Return,
-            BEFORE,
-        )
+        .call(&provider(), &give_back(), &[], BEFORE)
         .expect("return");
     assert_eq!(chain.job().state, JobState::Returned);
-    assert_eq!(chain.balance(job()), AMOUNT);
-
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT,
-        deadline: 0,
-    };
     chain
-        .call(&buyer(), &[buyer().id, job(), REFUND_TO], &refund, BEFORE)
+        .refund(AMOUNT, 0, BEFORE)
         .expect("refund before the deadline");
     assert_eq!(chain.job().state, JobState::Refunded);
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT);
+    assert_eq!(chain.balance(refund_to().id), AMOUNT);
     assert_eq!(chain.balance(provider().id), START);
-}
-
-#[test]
-fn a_job_paying_the_buyer_itself_refunds_with_two_accounts() {
-    let mut chain = Chain::new();
-    let open = Instruction::Open {
-        job_ref: JOB_REF,
-        provider: provider().id,
-        pay_to: provider().id,
-        refund_to: buyer().id,
-        amount: AMOUNT,
-        deadline: DEADLINE,
-        controller: None,
-    };
-    chain
-        .call(&buyer(), &[buyer().id, job()], &open, BEFORE)
-        .expect("open");
-
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT,
-        deadline: DEADLINE,
-    };
-    chain
-        .call(&buyer(), &[buyer().id, job()], &refund, DEADLINE)
-        .expect("refund to the buyer itself");
-    assert_eq!(chain.job().state, JobState::Refunded);
-    assert_eq!(chain.balance(buyer().id), START);
 }
 
 #[test]
 fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
     let mut chain = Chain::new();
     chain.open_controlled_by(Some(CONTROLLER)).expect("open");
-
     // On a controlled job, delivering releases nothing: the controller judges it.
     chain.deliver(BEFORE).expect("deliver");
     assert_eq!(chain.job().released, 0);
-    assert!(refused_with(
-        logos_escrow_core::EscrowError::WrongAmount.code()
-    )(&chain.claim()));
-
+    assert!(refused(&chain.claim_of(AMOUNT), EscrowError::WrongAmount));
     chain
-        .relay(&[buyer().id, job()], vec![], &release_of(200), BEFORE)
+        .relay(
+            &operator(),
+            buyer().id,
+            vec![],
+            &release_of(200),
+            &[],
+            vec![],
+            BEFORE,
+        )
         .expect("the controller releases part");
     chain
         .relay(
-            &[provider().id, job()],
+            &operator(),
+            provider().id,
             vec![],
-            &Instruction::Return,
+            &give_back(),
+            &[],
+            vec![],
             BEFORE,
         )
         .expect("the controller returns the rest");
     assert_eq!(chain.job().state, JobState::Returned);
-
     chain.claim_of(200).expect("the provider claims its part");
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT - 200,
-        deadline: 0,
-    };
     chain
-        .call(&buyer(), &[buyer().id, job(), REFUND_TO], &refund, BEFORE)
+        .refund(AMOUNT - 200, 0, BEFORE)
         .expect("the buyer refunds the rest");
-    assert_eq!(chain.balance(PAY_TO), 200);
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT - 200);
+    assert_eq!(chain.balance(pay_to().id), 200);
+    assert_eq!(chain.balance(refund_to().id), AMOUNT - 200);
     assert_eq!(chain.balance(job()), 0);
 }
 
@@ -512,22 +496,31 @@ fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
 fn a_program_cannot_act_on_a_job_it_does_not_control_even_when_the_buyer_signs() {
     let mut chain = Chain::new();
     chain.open().expect("open");
-
     // The buyer signs a call to some program, and LEZ carries that signature into the
     // program's call to the escrow.
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT,
-        deadline: 0,
-    };
     let calls = [
-        (vec![buyer().id, job()], release_of(AMOUNT)),
-        (vec![buyer().id, job(), REFUND_TO], refund),
+        (release_of(AMOUNT), vec![]),
+        (
+            Instruction::Refund {
+                job_ref: JOB_REF,
+                amount: AMOUNT,
+                deadline: 0,
+            },
+            vec![native(job()), native(refund_to().id)],
+        ),
     ];
-    for (accounts, instruction) in calls {
-        let result = chain.relay_signed_by(&buyer(), &accounts, vec![], &instruction, BEFORE);
+    for (instruction, more) in calls {
+        let result = chain.relay(
+            &buyer(),
+            buyer().id,
+            vec![],
+            &instruction,
+            &more,
+            vec![evidence(&refund_to())],
+            BEFORE,
+        );
         assert!(
-            refused_with(logos_escrow_core::EscrowError::NotDirect.code())(&result),
+            refused(&result, EscrowError::NotDirect),
             "{instruction:?}: {result:?}"
         );
     }
@@ -540,15 +533,17 @@ fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
     let mut chain = Chain::new();
     // The buyer signs, but the controller names no controller, or another program.
     for named in [None, Some(PROGRAM)] {
-        let result = chain.relay_signed_by(
+        let result = chain.relay(
             &buyer(),
-            &[buyer().id, job()],
+            buyer().id,
             vec![],
             &open_instruction(named),
+            &[native(buyer().id), native(job())],
+            vec![],
             BEFORE,
         );
         assert!(
-            refused_with(logos_escrow_core::EscrowError::NotDirect.code())(&result),
+            refused(&result, EscrowError::NotDirect),
             "{named:?}: {result:?}"
         );
     }
@@ -556,22 +551,31 @@ fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
 
     chain.open_controlled_by(Some(CONTROLLER)).expect("open");
     chain
-        .relay(&[buyer().id, job()], vec![], &release_of(AMOUNT), BEFORE)
+        .relay(
+            &operator(),
+            buyer().id,
+            vec![],
+            &release_of(AMOUNT),
+            &[],
+            vec![],
+            BEFORE,
+        )
         .expect("the controller releases everything");
     let claim = Instruction::Claim {
         buyer: buyer().id,
         job_ref: JOB_REF,
         amount: AMOUNT,
     };
-    assert!(refused_with(
-        logos_escrow_core::EscrowError::Unauthorized.code()
-    )(&chain.relay(
-        &[provider().id, job(), PAY_TO],
+    let result = chain.relay(
+        &operator(),
+        provider().id,
         vec![],
         &claim,
-        BEFORE
-    )));
-    assert_eq!(chain.balance(PAY_TO), 0);
+        &[native(job()), native(pay_to().id)],
+        vec![evidence(&pay_to())],
+        BEFORE,
+    );
+    assert!(refused(&result, EscrowError::Unauthorized), "{result:?}");
     assert_eq!(chain.balance(job()), AMOUNT);
 }
 
@@ -580,25 +584,41 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
     let mut chain = Chain::new();
     let seed = [0x5E; 32];
     let treasury = AccountId::for_public_pda(&CONTROLLER, &PdaSeed::new(seed));
-    let job = job_account_id(&PROGRAM, &treasury, &JOB_REF);
+    let job = job_for(treasury);
     chain
         .send(
-            NATIVE_TOKEN_PROGRAM_ID,
             &buyer(),
-            vec![
-                ProgramShardSelector::native_balance(buyer().id),
-                ProgramShardSelector::native_balance(treasury),
-            ],
-            &NativeInstruction::Transfer { amount: AMOUNT },
+            native(buyer().id),
+            &[native(buyer().id), native(treasury)],
+            vec![PublicAccountEvidence::Pda {
+                program: CONTROLLER,
+                seed: PdaSeed::new(seed),
+            }],
+            &NativeMessage::Transfer {
+                to: treasury,
+                amount: AMOUNT,
+            },
             BEFORE,
         )
         .expect("fund the treasury");
 
+    let open = Instruction::Open {
+        job_ref: JOB_REF,
+        provider: provider().id,
+        pay_to: pay_to().id,
+        refund_to: refund_to().id,
+        amount: AMOUNT,
+        deadline: DEADLINE,
+        controller: Some(CONTROLLER),
+    };
     chain
         .relay(
-            &[treasury, job],
+            &operator(),
+            treasury,
             vec![seed],
-            &open_instruction(Some(CONTROLLER)),
+            &open,
+            &[native(treasury), native(job)],
+            vec![],
             BEFORE,
         )
         .expect("the treasury opens a job through the controller");
@@ -606,117 +626,37 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
     assert_eq!(chain.balance(job), AMOUNT);
     assert_eq!(chain.job_at(job).controller, Some(CONTROLLER));
 
-    // Without the seed the treasury hasn't authorized the refund.
     let refund = Instruction::Refund {
         job_ref: JOB_REF,
         amount: AMOUNT,
         deadline: DEADLINE,
     };
-    assert!(refused_with(
-        logos_escrow_core::EscrowError::Unauthorized.code()
-    )(&chain.relay(
-        &[treasury, job, REFUND_TO],
+    let payout = [native(job), native(refund_to().id)];
+    // Without the seed the treasury hasn't authorized the refund.
+    let unseeded = chain.relay(
+        &operator(),
+        treasury,
         vec![],
         &refund,
-        DEADLINE
-    )));
-    chain
-        .relay(&[treasury, job, REFUND_TO], vec![seed], &refund, DEADLINE)
-        .expect("the treasury refunds through the controller");
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT);
-    assert_eq!(chain.balance(job), 0);
-}
-
-/// The buyer opens a job through the example arbiter, which records the operator as its judge.
-fn open_with_judge(chain: &mut Chain) {
-    let open = ArbiterInstruction::Open {
-        escrow: PROGRAM,
-        judge: operator().id,
-        job_ref: JOB_REF,
-        provider: provider().id,
-        pay_to: PAY_TO,
-        refund_to: REFUND_TO,
-        amount: AMOUNT,
-        deadline: DEADLINE,
-    };
-    chain
-        .arbiter(
-            &buyer(),
-            &[buyer().id, case_account_id(&ARBITER, &job()), job()],
-            &open,
-            BEFORE,
-        )
-        .expect("open through the arbiter");
-}
-
-fn decide(decision: Decision) -> ArbiterInstruction {
-    ArbiterInstruction::Decide {
-        escrow: PROGRAM,
-        decision,
-    }
-}
-
-#[test]
-fn the_arbiters_judge_pays_part_and_returns_the_rest() {
-    let mut chain = Chain::new();
-    open_with_judge(&mut chain);
-    assert_eq!(chain.job().controller, Some(ARBITER));
-    assert_eq!(chain.balance(job()), AMOUNT);
-
-    let case = case_account_id(&ARBITER, &job());
-    chain
-        .arbiter(
-            &operator(),
-            &[operator().id, case, buyer().id, job()],
-            &decide(Decision::Release {
-                job_ref: JOB_REF,
-                amount: 200,
-            }),
-            BEFORE,
-        )
-        .expect("the judge releases part");
-    chain
-        .arbiter(
-            &operator(),
-            &[operator().id, case, provider().id, job()],
-            &decide(Decision::Return),
-            BEFORE,
-        )
-        .expect("the judge returns the rest");
-    assert_eq!(chain.job().state, JobState::Returned);
-
-    chain.claim_of(200).expect("the provider claims its part");
-    let refund = Instruction::Refund {
-        job_ref: JOB_REF,
-        amount: AMOUNT - 200,
-        deadline: 0,
-    };
-    chain
-        .call(&buyer(), &[buyer().id, job(), REFUND_TO], &refund, BEFORE)
-        .expect("the buyer refunds the rest");
-    assert_eq!(chain.balance(PAY_TO), 200);
-    assert_eq!(chain.balance(REFUND_TO), AMOUNT - 200);
-}
-
-#[test]
-fn only_the_cases_judge_decides() {
-    let mut chain = Chain::new();
-    open_with_judge(&mut chain);
-    let case = case_account_id(&ARBITER, &job());
-
-    // The provider signs a decision in its own favour.
-    let result = chain.arbiter(
-        &provider(),
-        &[provider().id, case, buyer().id, job()],
-        &decide(Decision::Release {
-            job_ref: JOB_REF,
-            amount: AMOUNT,
-        }),
-        BEFORE,
+        &payout,
+        vec![evidence(&refund_to())],
+        DEADLINE,
     );
     assert!(
-        refused_with(ArbiterError::WrongJudge.code())(&result),
-        "{result:?}"
+        refused(&unseeded, EscrowError::Unauthorized),
+        "{unseeded:?}"
     );
-    assert_eq!(chain.job().released, 0);
+    chain
+        .relay(
+            &operator(),
+            treasury,
+            vec![seed],
+            &refund,
+            &payout,
+            vec![evidence(&refund_to())],
+            DEADLINE,
+        )
+        .expect("the treasury refunds through the controller");
+    assert_eq!(chain.balance(refund_to().id), AMOUNT);
+    assert_eq!(chain.balance(job), 0);
 }

@@ -1,16 +1,18 @@
 [workspace]
 resolver = "3"
-members = ["core", "integration", "cli", "examples/arbiter", "examples/arbiter/client"]
-exclude = ["methods/guest"]
+# The CLI and the arbiter client run on LEZ v0.3.1's wallet and wait for a 0.4 chain to test
+# against (logos-devnet support, a lez_core 0.4 release), so they're out of the 0.4 workspace.
+members = ["core", "integration"]
+exclude = ["methods/guest", "cli", "examples/arbiter/client", "examples/arbiter/guest"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-# LEZ v0.3.1 is the release the public testnet runs and lez_core 0.5.1 is built on.
+# LEZ v0.4.0-rc3, the newest tagged 0.4 release: no final v0.4.0 or 0.4 testnet exists yet.
 [workspace.dependencies]
-lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
-lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.4.0-rc3" }
+lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.4.0-rc3" }
 borsh = { version = "1.5.7", features = ["derive"] }
 risc0-zkvm = { version = "=3.0.5", default-features = false, features = ["std"] }
