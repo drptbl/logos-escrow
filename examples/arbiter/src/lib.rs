@@ -117,8 +117,10 @@ impl ArbiterError {
             Self::WrongCase => 103,
             Self::CaseExists => 104,
             Self::WrongJudge => 105,
-            Self::NoCase => 106,
-            Self::NotDirect => 107,
+            // 106 was WrongEscrow, which 0.4's routing makes impossible; it stays unused so the
+            // other codes keep their meaning.
+            Self::NoCase => 107,
+            Self::NotDirect => 108,
         }
     }
 }

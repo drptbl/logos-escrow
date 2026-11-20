@@ -255,6 +255,23 @@ fn a_decision_needs_a_case() {
     );
 }
 
+/// The codes a client reads a refusal by.
+#[test]
+fn arbiter_codes_are_stable() {
+    let codes = [
+        (ArbiterError::InvalidInstruction, 101),
+        (ArbiterError::Unauthorized, 102),
+        (ArbiterError::WrongCase, 103),
+        (ArbiterError::CaseExists, 104),
+        (ArbiterError::WrongJudge, 105),
+        (ArbiterError::NoCase, 107),
+        (ArbiterError::NotDirect, 108),
+    ];
+    for (error, code) in codes {
+        assert_eq!(error.code(), code, "{error:?}");
+    }
+}
+
 /// Arbiter refusals use codes the escrow's errors (1 to 11) never do, so a refusal says which
 /// program refused.
 #[test]
