@@ -11,6 +11,9 @@ use logos_escrow_arbiter::{ArbiterInstruction, Case, Decision, case_account_id};
 use logos_escrow_core::{Hash32, Job, job_account_id};
 use wallet::{AccountIdentity, AccountMention, WalletCore, WalletSequencerClient};
 
+/// Where the instruction goes: the first account given, the signer's own actor under the arbiter.
+const SIGNER_ACTOR: usize = 0;
+
 #[derive(Parser)]
 #[command(about = "Drive the example arbiter from a LEZ wallet")]
 struct Args {
@@ -137,6 +140,7 @@ async fn main() -> Result<()> {
             let party = AccountIdentity::PublicNoSign(job.buyer).select_program_actor_state(escrow);
             client.send(&job, judge, vec![party], &decide).await
         }
+        Command::Show { job } => client.show(&job).await,
         Command::Return { job, judge } => {
             let provider = client.job(&job).await?.provider;
             let decide = ArbiterInstruction::Decide {
@@ -148,7 +152,6 @@ async fn main() -> Result<()> {
             let party = AccountIdentity::PublicNoSign(provider).select_program_actor_state(escrow);
             client.send(&job, judge, vec![party], &decide).await
         }
-        Command::Show { job } => client.show(&job).await,
     }
 }
 
@@ -182,7 +185,7 @@ impl<C: WalletSequencerClient> Client<C> {
         accounts.extend(more);
         let hash = self
             .wallet
-            .send_pub_tx(accounts, 0, borsh::to_vec(instruction)?)
+            .send_pub_tx(accounts, SIGNER_ACTOR, borsh::to_vec(instruction)?)
             .await
             .map_err(|error| anyhow::anyhow!("send failed: {error:?}"))?;
         let (_, block) = self
