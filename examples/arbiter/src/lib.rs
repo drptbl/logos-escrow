@@ -8,8 +8,9 @@
 //!
 //! LEZ v0.4 delivers each message to one actor. The buyer's `Open` and the judge's `Decide` reach
 //! their own actors under the arbiter, where `is_authorized` says whether they signed. Those
-//! actors pass the case on to the case's actor, which only the arbiter itself can reach, and which
-//! calls the escrow. A refusal anywhere fails the whole transaction, escrow call included.
+//! actors pass the case on to the case's actor, which only the arbiter itself can reach. The job
+//! names that actor as its controller, and it sends the judge's decision straight to the job. A
+//! refusal anywhere fails the whole transaction, escrow call included.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
@@ -17,6 +18,7 @@ use lee_core::{
     account::{AccountId, Actor, Balance},
     program::{PdaSeed, ReceiveInput, Response, SyncMessage},
 };
+pub use logos_escrow_core::Decision;
 use logos_escrow_core::{Hash32, Instruction as EscrowInstruction, job_account_id};
 use risc0_zkvm::sha::{Impl, Sha256 as _};
 
@@ -66,21 +68,12 @@ pub enum ArbiterInstruction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum Decision {
-    /// Lets the provider claim `amount` more.
-    Release { amount: Balance },
-    /// Gives what was never released back to the buyer.
-    Return,
-}
-
 /// What the case account holds.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Case {
     pub escrow: AccountId,
     pub judge: AccountId,
     pub buyer: AccountId,
-    pub provider: AccountId,
     pub job_ref: Hash32,
 }
 
@@ -178,11 +171,11 @@ fn on_signer(
                 escrow,
                 judge,
                 buyer: signer,
-                provider,
                 job_ref,
             };
             // The buyer's signature carries into this call, and the escrow takes it only because
-            // the job names this program, the caller, as its controller.
+            // the job names an actor of this program, the caller, as its controller: the case's,
+            // which is where the decisions come from.
             Ok(Response::keep_state()
                 .send(to_case(arbiter, &job, &ToCase::Record(case)))
                 .send_sync(
@@ -194,7 +187,7 @@ fn on_signer(
                         refund_to,
                         amount,
                         deadline,
-                        controller: Some(arbiter),
+                        controller: Some(Actor::new(case_account_id(&arbiter, &job), arbiter)),
                     },
                 ))
         }
@@ -255,23 +248,16 @@ fn on_case(input: &ReceiveInput, message: ToCase) -> Result<Response, ArbiterErr
             if case.judge != judge {
                 return Err(ArbiterError::WrongJudge);
             }
-            let (party, instruction) = match decision {
-                Decision::Release { amount } => (
-                    case.buyer,
-                    EscrowInstruction::Release {
-                        job_ref: case.job_ref,
-                        amount,
-                    },
-                ),
-                Decision::Return => (
-                    case.provider,
-                    EscrowInstruction::Return {
-                        buyer: case.buyer,
-                        job_ref: case.job_ref,
-                    },
-                ),
-            };
-            Ok(Response::keep_state().send_sync(Actor::new(party, case.escrow), &instruction))
+            // Straight to the job, from this case's actor, which the job names as its controller.
+            let job = job_account_id(&case.escrow, &case.buyer, &case.job_ref);
+            Ok(Response::keep_state().send_sync(
+                Actor::new(job, case.escrow),
+                &EscrowInstruction::Decide {
+                    buyer: case.buyer,
+                    job_ref: case.job_ref,
+                    decision,
+                },
+            ))
         }
     }
 }

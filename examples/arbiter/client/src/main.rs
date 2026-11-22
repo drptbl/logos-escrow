@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
-use lee_core::account::{AccountId, Balance};
+use lee_core::account::{AccountId, Actor, Balance};
 use logos_escrow_arbiter::{ArbiterInstruction, Case, Decision, case_account_id};
 use logos_escrow_core::{Hash32, Job, job_account_id};
 use wallet::{AccountIdentity, AccountMention, WalletCore, WalletSequencerClient};
@@ -225,7 +225,9 @@ impl<C: WalletSequencerClient> Client<C> {
         let case: Case = borsh::from_slice(&shard)?;
         // The arbiter calls the escrow a case names with the judge's signature, so a judge
         // decides only cases that name the real one.
-        if case.escrow != self.escrow || record.controller != Some(self.arbiter) {
+        if case.escrow != self.escrow
+            || record.controller != Some(Actor::new(case_account, self.arbiter))
+        {
             bail!("the case or the job names another escrow or controller: don't work on it");
         }
         println!("judge {}", case.judge);

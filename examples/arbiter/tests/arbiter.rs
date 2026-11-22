@@ -113,7 +113,7 @@ fn open_records_the_case_and_opens_the_job_naming_the_arbiter() {
             refund_to: BUYER,
             amount: 500,
             deadline: 1_800_000_000_000,
-            controller: Some(ARBITER),
+            controller: Some(Actor::new(case(), ARBITER)),
         },
     )));
     let case: Case = borsh::from_slice(&opened()).expect("a case");
@@ -123,7 +123,6 @@ fn open_records_the_case_and_opens_the_job_naming_the_arbiter() {
             escrow: ESCROW,
             judge: JUDGE,
             buyer: BUYER,
-            provider: PROVIDER,
             job_ref: JOB_REF,
         }
     );
@@ -188,31 +187,24 @@ fn only_the_cases_judge_decides_and_only_for_its_escrow() {
 }
 
 #[test]
-fn the_judges_decision_reaches_the_right_party() {
-    let release = at_signer(JUDGE, true, None, &release(ESCROW)).expect("plans");
-    let to_buyer = at_case(JUDGE, &release, &opened()).expect("applies");
-    assert_eq!(
-        to_buyer.sync_messages,
-        vec![SyncMessage::new(
-            Actor::new(BUYER, ESCROW),
-            &EscrowInstruction::Release {
-                job_ref: JOB_REF,
-                amount: 100,
-            },
-        )]
-    );
-    let give_back = at_signer(JUDGE, true, None, &decide(ESCROW, Decision::Return)).expect("plans");
-    let to_provider = at_case(JUDGE, &give_back, &opened()).expect("applies");
-    assert_eq!(
-        to_provider.sync_messages,
-        vec![SyncMessage::new(
-            Actor::new(PROVIDER, ESCROW),
-            &EscrowInstruction::Return {
-                buyer: BUYER,
-                job_ref: JOB_REF,
-            },
-        )]
-    );
+fn the_judges_decision_goes_straight_to_the_job() {
+    // From the case's actor, which the job names as its controller.
+    for decision in [Decision::Release { amount: 100 }, Decision::Return] {
+        let sent = at_signer(JUDGE, true, None, &decide(ESCROW, decision)).expect("plans");
+        let at_the_case = at_case(JUDGE, &sent, &opened()).expect("applies");
+        assert_eq!(
+            at_the_case.sync_messages,
+            vec![SyncMessage::new(
+                Actor::new(job(), ESCROW),
+                &EscrowInstruction::Decide {
+                    buyer: BUYER,
+                    job_ref: JOB_REF,
+                    decision,
+                },
+            )],
+            "{decision:?}"
+        );
+    }
 }
 
 #[test]
