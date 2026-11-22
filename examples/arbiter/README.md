@@ -6,13 +6,14 @@ An escrow controller you can start from. The buyer opens a job through the arbit
 
 | Call | Sent to | What happens |
 | --- | --- | --- |
-| `Open` | `Actor(buyer, arbiter)`, signed by the buyer | The arbiter records the case, then opens the escrow job naming itself as the controller. |
-| `Decide`, `Release` | `Actor(judge, arbiter)`, signed by the judge | The arbiter lets the provider claim part of the deposit. |
-| `Decide`, `Return` | `Actor(judge, arbiter)`, signed by the judge | The arbiter gives what was never released back to the buyer. |
+| `Open` | `Actor(buyer, arbiter)`, signed by the buyer | The arbiter records the case, then opens the escrow job naming the case's actor as its controller. |
+| `Decide`, `Release` | `Actor(judge, arbiter)`, signed by the judge | The case's actor tells the job to let the provider claim part of the deposit. |
+| `Decide`, `Return` | `Actor(judge, arbiter)`, signed by the judge | The case's actor tells the job to give what was never released back to the buyer. |
 
-- The case lives in the arbiter's own case account, derived from the job account. It holds the escrow, the judge, the buyer, the provider and the job reference.
+- The case lives in the arbiter's own case account, derived from the job account. It holds the escrow, the judge, the buyer and the job reference.
+- The job names the case's actor as its controller, so only this case's decisions reach it: not another case's, and not a call from anywhere else.
 - `Open` derives the job from the buyer who signed, so nobody can record a case for someone else's job.
-- The judge is checked at the case's actor, which only the arbiter itself can reach. A decision from anyone else fails whole, escrow call included.
+- The judge is checked at the case's actor, which only the arbiter itself can reach, and which sends the decision straight to the job. A decision from anyone else fails whole, escrow call included.
 - The judge has to call directly. LEZ carries a signature into every program call, so a program the judge signs for can't decide in the judge's name.
 - On a controlled job, delivering releases nothing: the provider's `Deliver` only records the result for the judge to look at.
 
@@ -113,7 +114,6 @@ logos_escrow_core = { git = "https://github.com/drptbl/logos-escrow", rev = "<co
 
 ## Limits
 
-- It has only run with public parties.
-- A decision reaches the escrow through the party's own actor, so with a private buyer or provider it needs that party's witness, and an offline private party blocks it.
+- It has only run with public parties. A decision names no party, though: the escrow's own devnet test has a controller decide a job between private parties in a public call.
 - The judge is an account with a key. A program can't be the judge, since decisions have to be direct calls.
 - A judge that never decides leaves the buyer to refund what was never released after the deadline. Until that refund lands, the judge can still release.

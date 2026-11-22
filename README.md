@@ -40,14 +40,16 @@ The record also counts lepta: `released` is how much of `amount` the provider ma
 
 ## Controllers
 
-A job can name a controller at `Open`, a program that acts on it besides the buyer and provider. It sends the escrow the same instruction a party would, to the party's actor, without the party's signature.
+A job can name a controller at `Open`: one actor, an account's state under a program, that acts on the job besides the buyer and provider. It decides by sending `Decide` straight to the job's actor, and only that exact actor can: not another account under the same program, and not the transaction itself.
 
-- The controller can `Release` any part of what's left and `Return` the job without the parties. Those are an arbiter's two decisions: pay the provider, or give the rest back.
-- `Deliver`, `Claim` and `Refund` still need the party they name, even from the controller. So only the side being paid pulls a payout, and a controller can't pull one publicly to a private payout address, where it would be lost. A party that is the controller's own PDA signs through it, with the PDA's seed on the call.
+- The controller can `Release` any part of what's left and `Return` the job. Those are an arbiter's two decisions: pay the provider, or give the rest back. A decision names no party, so a private party being offline can't hold it up.
+- `Deliver`, `Claim` and `Refund` stay with the party they name, and so does every call through a party's actor, even from the controller's program. So only the side being paid pulls a payout, and a controller can't pull one publicly to a private payout address, where it would be lost. A party that is a PDA of the controller's program signs through it, with the PDA's seed on the call.
 - On a controlled job, delivering only records the result. The provider gets paid when the buyer or the controller releases.
 - The parties keep their direct calls. The deadline still lets the buyer refund what was never released, so a stuck controller can't lock the money. The controller can still release after the deadline, but only a release that lands before the buyer's refund counts. So set a deadline that leaves it time after the work is due: a delivery just before the deadline leaves it none.
-- A program can only act on jobs that name it. A program that opens a job has to name itself, and a call from any other program is refused with `NotDirect`.
-- A party that is a program's PDA can only act through that program, so that program has to be the job's controller. Make a PDA provider for a job controlled by another program, or by none, and it can never deliver or claim: whatever was released to it stays in the job account.
+- A program can only call for a party on a job whose controller is one of its actors, and a program that opens a job has to name one of its own. Anything else is refused with `NotDirect`.
+- A party that is a program's PDA can only act through that program, so that program has to be the job's controller's. Make a PDA provider for a job controlled by another program, or by none, and it can never deliver or claim: whatever was released to it stays in the job account.
+
+A controller decides from one fixed actor, which has to be public: LEZ shows a private sender under a blinded alias, which never matches. The example arbiter opens each job from the buyer's actor and names its own case account's actor, where the judge's decisions come from.
 
 The controller decides who gets the money, never where it goes: payouts only reach `pay_to` and `refund_to`. Read what the controller does, and whether it can be updated, before you open or take a controlled job.
 
@@ -82,6 +84,7 @@ LEZ 0.4 delivers each message to an actor: one account's state under one program
 | `Release` | `Actor(buyer, escrow)` | `job` | `Open`, `amount` up to `amount - released` | nothing |
 | `Refund` | `Actor(buyer, escrow)` | `job`, `native(job)`, `native(refund_to)` | `Open` from `deadline` on, or `Returned` | `amount - released` from job to `refund_to` |
 | `Return` | `Actor(provider, escrow)` | `job` | `Open` | nothing |
+| `Decide` | `job`, from the job's controller | `job` | `Open`: a `Release` or a `Return` | nothing |
 
 LEZ admits a public account the chain has never seen into a transaction only with its public key as evidence. So a `Claim` or `Refund` to a fresh public `pay_to` or `refund_to` carries that account's key. The side being paid sends the call, so it has it.
 
@@ -97,12 +100,15 @@ Borsh: one variant byte, then the fields in order. Integers are little-endian, a
 
 | Byte 0 | Instruction | Fields | Length |
 | --- | --- | --- | --- |
-| `0` | `Open` | `job_ref: [u8; 32]`, `provider: [u8; 32]`, `pay_to: [u8; 32]`, `refund_to: [u8; 32]`, `amount: u128`, `deadline: u64`, `controller: Option<[u8; 32]>` | 154, or 186 with a controller |
+| `0` | `Open` | `job_ref: [u8; 32]`, `provider: [u8; 32]`, `pay_to: [u8; 32]`, `refund_to: [u8; 32]`, `amount: u128`, `deadline: u64`, `controller: Option<Actor>` | 154, or 218 with a controller |
 | `1` | `Deliver` | `buyer: [u8; 32]`, `job_ref: [u8; 32]`, `result: [u8; 32]`, `deadline: u64` | 105 |
 | `2` | `Claim` | `buyer: [u8; 32]`, `job_ref: [u8; 32]`, `amount: u128` | 81 |
 | `3` | `Release` | `job_ref: [u8; 32]`, `amount: u128` | 49 |
 | `4` | `Refund` | `job_ref: [u8; 32]`, `amount: u128`, `deadline: u64` | 57 |
 | `5` | `Return` | `buyer: [u8; 32]`, `job_ref: [u8; 32]` | 65 |
+| `6` | `Decide` | `buyer: [u8; 32]`, `job_ref: [u8; 32]`, `decision`: `0` and `amount: u128` to release, or `1` to return | 82 or 66 |
+
+An `Actor` is its account then its program, 32 bytes each.
 
 `Deliver { buyer: [1; 32], job_ref: [9; 32], result: [4; 32], deadline: 1800000000000 }` encodes to:
 
@@ -130,7 +136,7 @@ The record is Borsh:
 | `deadline` | `u64`, milliseconds |
 | `state` | `u8`: `0` Open, `1` Delivered, `2` Returned, `3` Refunded |
 | `result` | `Option<[u8; 32]>` |
-| `controller` | `Option<[u8; 32]>` |
+| `controller` | `Option<Actor>` |
 
 `core/tests/escrow.rs` (`the_job_record_and_controlled_open_layout_are_stable`) pins a whole record against a literal.
 
@@ -160,7 +166,7 @@ The program refuses a call by exiting with one of these codes. The LEZ wallet ru
 | 8 | `NoJob` | no record in the job account |
 | 9 | `WrongState` | the job isn't in a state this instruction takes |
 | 10 | `WrongAmount` | `amount` is zero, more than a `Release` or `Claim` may move, or not what a `Refund` returns |
-| 11 | `NotDirect` | a program other than the job's controller called the escrow, or a program opened a job without naming itself |
+| 11 | `NotDirect` | a program called for a party on a job its actors don't control, opened a job naming another program's actor, or a decision didn't come from the job's exact controller |
 
 LEZ itself refuses the rest, so check the deadline, the declared actors and the buyer's balance before you send:
 

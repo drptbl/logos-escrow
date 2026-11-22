@@ -32,8 +32,8 @@ Rules every call keeps:
 
 Start from [examples/arbiter](../../examples/arbiter/README.md): what it does, what a provider and a judge check, and how to copy it into your project. Then hold to these, which the README's Controllers section explains:
 
-- Your program opens the job itself and names its own program id as `controller`. The escrow refuses a program that names anything else.
-- Your program alone may `Release` and `Return` without the parties, by sending the instruction to the party's actor under the escrow. `Deliver`, `Claim` and `Refund` stay with the party they name, or with your program's PDA when you send its seed with the call.
+- Name one public actor of your program as the job's `controller`, the one your decisions come from: the escrow takes `Decide` only from that exact actor. A private actor shows up under a blinded alias and never matches. Your program opens the job itself, from any of its actors, and names one of its own.
+- Decide with `Decide` sent straight to the job's actor `Actor(job, escrow)`: a `Release` or a `Return`, with no party. `Deliver`, `Claim` and `Refund` stay with the party they name, through the party's actor, or with your program's PDA when you send its seed with the call.
 - Take a signer's call at its own actor under your program, where `is_authorized` says it signed. Keep your state on PDA actors of your own, send to them with the PDA's seed so LEZ admits a fresh one, and accept their messages only when `from_own_program()` holds.
 - Take a decision only from a direct call (`from` is `None`). LEZ carries a signature into every program call, so otherwise any program your decider signs for could decide in their name.
 - Pass identities in your own messages, not through `from.account_id`: a private sender shows up there under a blinded alias.
