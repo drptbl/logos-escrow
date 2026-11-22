@@ -89,7 +89,7 @@ Name every party, payee and controller by its canonical account id. LEZ resolves
 
 Each instruction also carries the values the record must match, and the call fails when they don't. Read the record first: `Deliver` quotes its `deadline`, a `Claim` takes at most `released - claimed`, and a `Refund` exactly `amount - released`. A `Refund` after a `Return` passes `deadline` 0, because the deadline no longer applies.
 
-`lez_core` has no 0.4 release yet. Until then, `integration/tests/flows.rs` builds every one of these transactions, signed and declared as above, and runs it through LEZ's own state machine.
+`lez_core` has no 0.4 release yet. Until then, the [CLI](#cli) sends every one of these through the LEZ wallet, and `integration/tests/flows.rs` builds them by hand and runs them through LEZ's own state machine.
 
 ### Instruction data
 
@@ -138,15 +138,15 @@ Read the counters to tell whether a job is settled, rather than `state`: a job r
 
 ## Private accounts
 
-The job stays public, but buyer and provider can be private accounts, and so can the payout addresses. Make each payout address a fresh private account for that one job, under the keys of whoever gets paid: the provider sends its `pay_to` with the quote, and the buyer picks its own `refund_to`.
+The job stays public, but buyer and provider can be private accounts, and so can the payout addresses. Make each payout address a fresh private account for that one job, in the wallet of whoever gets paid: the provider sends its `pay_to` with the quote, and the buyer picks its own `refund_to`. LEZ 0.4 derives a private account's id from its keys alone, so a fresh address is a new private account, which `payout-address` makes.
 
 Never pull to a private address in a public call. The program can't tell the two apart, so the money would land in a public account with that id, and nobody can sign for that.
 
-On LEZ 0.4 this hasn't run on a chain yet: private transactions there pay fees, and private account ids are derived differently than on v0.3. The rules don't change, and the tests cover them with public parties.
+Private transactions pay their fee in the proof, from a private account the sending wallet owns. On a `v0.4.0-rc3` devnet each one reserved about 5.2M lepta, so keep a funded private account for fees and pass it as `--payer`. A shielded transfer pays its fee from the funds it brings in.
 
 ## Errors
 
-The program refuses a call by exiting with one of these codes, and LEZ then charges only the cycles used. A refused public call is still included and pays for those cycles, so read the record again to see whether a call worked.
+The program refuses a call by exiting with one of these codes. The LEZ wallet runs a call before it sends it, and doesn't send one the program refuses: it reports `Program exited with non-zero code <code>`. A call sent anyway is included and pays for the cycles it used, so read the record again to see whether a call worked.
 
 | Code | Error | Means |
 | --- | --- | --- |
@@ -168,9 +168,46 @@ LEZ itself refuses the rest, so check the deadline, the declared actors and the 
 - `NativeTransferFailed`: an `Open` the buyer can't fund
 - `UndeclaredActor`, `UnadmittedPublicActor`: a transaction that doesn't declare an actor it touches, or pays a fresh public account without its key
 
+## On your own devnet
+
+To test your project against the escrow, deploy it on a local [logos-devnet](https://github.com/drptbl/logos-devnet) chain: v0.10 and later run LEZ `v0.4.0-rc3`. Until there's a 0.4 release, build it with `make build` and point your `logos-devnet.toml` at the binary:
+
+```toml
+[programs]
+escrow = "path/to/logos-escrow/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/logos_escrow.bin"
+```
+
+`logos-devnet up` deploys it and exports its program id as `LOGOS_PROGRAM_ESCROW`, which the CLI reads.
+
 ## CLI
 
-`cli/` still runs on LEZ v0.3's wallet, so it isn't part of the 0.4 build. It comes back with a 0.4 wallet and a 0.4 chain to test against. For v0.3, use the one in release `v0.2.0`.
+`cli/` is a small client on the LEZ wallet, with the wallet at `LEE_WALLET_HOME_DIR`. It calls the program `LOGOS_PROGRAM_ESCROW` names, which logos-devnet exports. A call goes private when the signer or the payee is one of the wallet's private accounts:
+
+```bash
+export LEE_WALLET_HOME_DIR=~/my-wallet LOGOS_PROGRAM_ESCROW=<program id>
+cargo run -p logos_escrow_cli -- open --buyer <id> --job-ref <hex> --provider <id> --pay-to <id> --refund-to <id> --amount 1000000 --in-secs 3600
+cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
+```
+
+| Command | What it does |
+| --- | --- |
+| `open` | Buyer: locks `--amount` for `--provider` until `--deadline-ms`, or `--in-secs` from now. `--controller` names a controller. |
+| `deliver` | Provider: records `--result`, a 32-byte hex hash, before the deadline. |
+| `release` | Buyer: lets the provider claim `--amount` more, or everything left without it. |
+| `claim` | Provider: pulls everything released and not yet claimed to the job's `pay_to`. |
+| `return` | Provider: gives an open job up, so the buyer can refund at once. |
+| `refund` | Buyer: takes back everything never released to the job's `refund_to`. |
+| `show` | Prints the job's record and the lepta its account holds. |
+| `job-account` | Prints the job account for a buyer and job reference. |
+| `payout-address` | Makes a fresh private payout address in this wallet and prints its id. |
+
+Every command names the job with `--buyer` and `--job-ref` (64 hex characters), and each call prints the job's record once it lands. `--payer` pays the fee from another wallet account: a public one for a public call, a private one for a private call.
+
+Before it sends, the CLI checks the job record and its own clock, and stops a call the escrow or the deadline window would refuse. `--force` sends it anyway, and the wallet's own run of the call then stops one the program refuses.
+
+A payout goes to the job's `pay_to` or `refund_to`, which the wallet sending it holds: one of its private accounts, or a public account. For someone else's public account, pass `--public-payee`; it has to be on chain already. Otherwise the CLI refuses a payout it can't place.
+
+For v0.3, use the CLI in release `v0.2.0`.
 
 ## Build and test
 
@@ -182,6 +219,13 @@ make test
 ```
 
 `make build` builds the guest in RISC Zero's Docker image `r0.1.91.1`, the one LEZ `v0.4.0-rc3` builds its own programs with, so the image id is reproducible. `methods/guest/Cargo.lock` is part of that identity too: change it and the image id changes. `make test` runs the program's rules as plain Rust, then the built binary through LEZ `v0.4.0-rc3`'s state machine with real signatures, declared actors, program calls and deadlines. CI runs both.
+
+`cli/tests/devnet.rs` runs every flow on a logos-devnet chain, through the CLI and the LEZ wallet, with public and private parties and a program as controller. CI runs it too. Run it on a fresh chain, since it makes the same new private accounts every run:
+
+```bash
+make build && logos-devnet reset
+logos-devnet exec -- cargo test -p logos_escrow_cli --test devnet -- --ignored
+```
 
 `make build` also builds the [example arbiter](examples/arbiter), from its own guest crate so the escrow's image id never depends on it. Next to the escrow it builds `test_controller.bin`, a test-only program that relays whatever escrow call it gets, so the tests can call the escrow from another program. It checks nothing, so never deploy it anywhere that matters.
 
