@@ -15,7 +15,7 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
-  # The RISC Zero version LEZ v0.3.1 pins.
+  # The RISC Zero version LEZ v0.4.0-rc3 pins.
   RISC0_VERSION: 3.0.5
 
 jobs:
@@ -23,12 +23,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Needed to build the LEZ wallet crate the CLI depends on.
+      # LEZ's crates build native dependencies.
       - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config libssl-dev libpcsclite-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test -p logos_escrow_core
+      - run: cargo test -p logos_escrow_core -p logos_escrow_arbiter
 
   guest:
     runs-on: ubuntu-24.04
@@ -50,14 +50,14 @@ jobs:
           # risc0-build checks for this toolchain even when it builds in Docker.
           "$HOME/.risc0/bin/rzup" install rust
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Build the guest
-        run: make build | tee build.log
-      - name: Check the image id matches the deployed program
-        run: scripts/check-image-id.sh build.log
+      - name: Build the guests
+        run: make build
+      # Every flow through the built guests on LEZ's own state machine.
       - run: cargo test -p logos_escrow_integration
-      # Every flow on a local chain, through the CLI and the LEZ wallet `lez_core` wraps, with
-      # public and private parties. Starts the devnet from logos-devnet.toml and exports its env.
-      - uses: drptbl/logos-devnet@1a4b4cd67c0d562447c698bd12bf0dc3294ac76d # v0.8.0
+      # Every flow on a local LEZ v0.4 chain, through the CLI and the LEZ wallet, with public and
+      # private parties and a controller. Starts the devnet from logos-devnet.toml and exports its
+      # env.
+      - uses: drptbl/logos-devnet@c586b2fa959fa884e001bbb1593b9f64d5de25ee # v0.10.0
       - run: cargo test -p logos_escrow_cli --test devnet -- --ignored
       - name: The sequencer's log
         if: failure()

@@ -4,22 +4,24 @@ An escrow controller you can start from. The buyer opens a job through the arbit
 
 ## How it works
 
-| Call | Who | What happens |
+| Call | Sent to | What happens |
 | --- | --- | --- |
-| `Open` | the buyer | The arbiter records the judge in a case account derived from the job account, then opens the escrow job naming itself as the controller. |
-| `Decide`, `Release` | the judge | The arbiter lets the provider claim part of the deposit. |
-| `Decide`, `Return` | the judge | The arbiter gives what was never released back to the buyer. |
+| `Open` | `Actor(buyer, arbiter)`, signed by the buyer | The arbiter records the case, then opens the escrow job naming the case's actor as its controller. |
+| `Decide`, `Release` | `Actor(judge, arbiter)`, signed by the judge | The case's actor tells the job to let the provider claim part of the deposit. |
+| `Decide`, `Return` | `Actor(judge, arbiter)`, signed by the judge | The case's actor tells the job to give what was never released back to the buyer. |
 
-- The judge is checked in `apply`, against the case. A call from anyone else fails whole, escrow call included.
-- `Open` only takes the escrow's own job account for that buyer and job reference, so nobody can take the case of someone else's job.
+- The case lives in the arbiter's own case account, derived from the job account. It holds the escrow, the judge, the buyer and the job reference.
+- The job names the case's actor as its controller, so only this case's decisions reach it: not another case's, and not a call from anywhere else.
+- `Open` derives the job from the buyer who signed, so nobody can record a case for someone else's job.
+- The judge is checked at the case's actor, which only the arbiter itself can reach, and which sends the decision straight to the job. A decision from anyone else fails whole, escrow call included.
 - The judge has to call directly. LEZ carries a signature into every program call, so a program the judge signs for can't decide in the judge's name.
 - On a controlled job, delivering releases nothing: the provider's `Deliver` only records the result for the judge to look at.
 
-The program is [`src/lib.rs`](src/lib.rs), its zkVM entry point is in [`guest`](guest), and [`client`](client) is a small CLI that sends its calls for the walkthrough below. [`tests/arbiter.rs`](tests/arbiter.rs) covers every refusal, and the end of [`integration/tests/flows.rs`](../../integration/tests/flows.rs) runs it on LEZ's state machine.
+The program is [`src/lib.rs`](src/lib.rs), its zkVM entry point is in [`guest`](guest), and [`client`](client) is a small CLI that sends its calls for the walkthrough below. [`tests/arbiter.rs`](tests/arbiter.rs) covers every refusal, and the end of [`integration/tests/flows.rs`](../../integration/tests/flows.rs) runs the judge's whole flow on LEZ's state machine.
 
 ## What you need
 
-- `logos-devnet` and Docker
+- `logos-devnet` 0.10 or later, which runs LEZ `v0.4.0-rc3`, and Docker
 - Rust, `jq`, and `cargo-risczero` 3.0 (`rzup install cargo-risczero 3.0.5`, `rzup install rust`)
 - both programs built, from the repo root:
 
@@ -53,7 +55,7 @@ arbiter open --judge "$judge" --provider "$provider" --pay-to "$provider" --refu
 # job <job account>: Open, released 0, claimed 0
 ```
 
-Before working on it, the provider checks the case: it exists, and names the judge they expect:
+Before working on it, the provider checks the case: it exists, names the judge they expect, and the real escrow:
 
 ```bash
 arbiter show
@@ -67,11 +69,11 @@ The provider delivers. The record shows the result, still `Open` with `released:
 escrow deliver --result "$(printf 'the work' | shasum -a 256 | cut -d' ' -f1)"
 ```
 
-The provider tries to judge in its own favour. The call is included, as every refused public call is, and changes nothing:
+The provider tries to judge in its own favour. The wallet runs the call first and doesn't send it, since the arbiter refuses it with `WrongJudge`:
 
 ```bash
 arbiter release --judge "$provider" --amount 1000000
-# job <job account>: Open, released 0, claimed 0
+# Error: send failed: SimulatedRevert("Program exited with non-zero code 105 after <n> cycles")
 ```
 
 The judge pays the provider 400k, and the provider claims it. The job account then holds 600k:
@@ -95,22 +97,23 @@ escrow refund
 ## Before you take a job
 
 - **Check the case.** A buyer can open a job straight on the escrow and still name the arbiter as its controller. That job has no case, and can never get one, so no judge can decide it and the buyer refunds everything after the deadline. `arbiter show` refuses such a job.
+- **Check the escrow.** The arbiter calls whichever escrow a case names, with the judge's signature carried into that call. So a judge decides a case only when it names the real escrow, which `arbiter show` checks.
 - **Check the deadline.** From then on the buyer can refund what was never released. The judge can still release after it, but only a release that lands before the refund counts. A delivery just before the deadline leaves the judge no time, so take a job only with time for the judge after the work is due.
 
 ## Use it in your project
 
-Copy `src/lib.rs` and `guest/` into your project, and depend on the escrow's rules from its release tag:
+Copy `src/lib.rs` and `guest/` into your project, and depend on the escrow's rules from this repo. Until the first 0.4 release, pin a commit:
 
 ```toml
-logos_escrow_core = { git = "https://github.com/drptbl/logos-escrow", tag = "v0.2.0" }
+logos_escrow_core = { git = "https://github.com/drptbl/logos-escrow", rev = "<commit>" }
 ```
 
-- Build your guest in a crate of its own, as `guest/` here, and deploy it yourself. The escrow is already on testnet, see its [Deployment](../../README.md#deployment).
+- Build your guest in a crate of its own, as `guest/` here, and deploy it yourself.
 - Bind whatever you record to the escrow's job, as `Open` does with `job_account_id`, and take decisions only from direct calls.
 - Change who decides to fit your project: a committee, a deadline of your own, an oracle's account. The escrow only cares that the call comes from the controller its job names.
 
 ## Limits
 
-- It has only run with public parties. Private parties through a controller haven't been tried on a chain.
+- It has only run with public parties. A decision names no party, though: the escrow's own devnet test has a controller decide a job between private parties in a public call.
 - The judge is an account with a key. A program can't be the judge, since decisions have to be direct calls.
 - A judge that never decides leaves the buyer to refund what was never released after the deadline. Until that refund lands, the judge can still release.

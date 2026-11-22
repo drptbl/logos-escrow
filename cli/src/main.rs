@@ -1,45 +1,38 @@
-//! Calls the escrow program on a LEZ sequencer from a LEZ wallet (`LEE_WALLET_HOME_DIR`).
+//! Calls the escrow program on a LEZ v0.4 sequencer from a LEZ wallet (`LEE_WALLET_HOME_DIR`).
 //!
-//! A call goes public through `WalletCore::send_pub_tx_paid_by`, which `lez_core`'s
-//! `send_generic_public_transaction` calls, or private through
-//! `WalletCore::send_privacy_preserving_tx` when the signer is one of the wallet's private
-//! accounts or the payee is a private payout address. The job record is read back with
-//! `getAccount`.
+//! A party sends each instruction to its own actor under the escrow, declaring the job's actor
+//! and, for a call that moves lepta, both ends' native balances. A call goes public through
+//! `WalletCore::send_pub_tx_paid_by`, or private through `WalletCore::send_tx_with_pre_check`,
+//! the variant that takes a fee payer, when the signer or the payee is one of the wallet's private
+//! accounts. The job record is read back from the job account's escrow state.
 
 use std::{
-    collections::HashMap,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
-use lee::{privacy_preserving_transaction::circuit::ProgramWithDependencies, program::Program};
-use lee_core::{
-    Identifier, NullifierPublicKey,
-    account::{AccountId, Balance},
-    encryption::ViewingPublicKey,
-    program::PrivateAccountKind,
-};
+use lee::{privacy_preserving_transaction::circuit::ProgramCatalog, program::Program};
+use lee_core::account::{AccountId, Actor, Balance};
 use logos_escrow_core::{Hash32, Instruction, Job, JobState, job_account_id};
-use wallet::{AccountIdentity, AccountMention, WalletCore};
+use wallet::{AccountIdentity, AccountMention, AsyncDelivery, WalletCore, WalletSequencerClient};
 
-/// The escrow program on the LEZ testnet, as the README's Deployment table records it.
-const TESTNET_PROGRAM: &str = "H1VFAwgBoB8ECWQntzNVE7NpyFneVmtGFmZhJGwcT3sF";
+/// Where the instruction goes: the first account given, the party's own actor under the escrow.
+const PARTY_ACTOR: usize = 0;
 
 #[derive(Parser)]
-#[command(about = "Drive the logos-escrow program from a LEZ wallet")]
+#[command(about = "Drive the logos-escrow program from a LEZ v0.4 wallet")]
 struct Args {
-    /// The escrow program's header account id (base58): `LOGOS_PROGRAM_ESCROW`, which
-    /// logos-devnet exports, or the older `LOGOS_ESCROW_PROGRAM`, or else the testnet program.
+    /// The escrow program's header account id (base58). logos-devnet exports it.
     #[arg(long, env = "LOGOS_PROGRAM_ESCROW", global = true)]
     program: Option<AccountId>,
-    /// Send the call even when the job record says it will be refused, which a public call
-    /// still pays for.
+    /// Send the call even when the job record says it will be refused. The wallet runs it
+    /// first, and still won't send one the program refuses.
     #[arg(long, global = true)]
     force: bool,
-    /// A wallet account that pays a public transaction's fee; by default the signer pays.
-    /// Private transactions are fee-exempt.
+    /// A wallet account that pays the transaction's fee; by default the signer pays. A private
+    /// call pays its fee in the proof, from one of the wallet's private accounts.
     #[arg(long, global = true)]
     payer: Option<AccountId>,
     /// The escrow guest binary, which a private call proves locally.
@@ -68,12 +61,9 @@ struct JobArgs {
 struct PayoutArgs {
     #[command(flatten)]
     job: JobArgs,
-    /// The payout address file, when the address is a fresh private account (see
-    /// `payout-address`).
-    #[arg(long)]
-    payee_address: Option<PathBuf>,
-    /// Pay a public account this wallet holds no key for. Without it, the CLI refuses to send a
-    /// payout it can't place, because a private address paid publicly is burned.
+    /// Pay a public account this wallet holds no key for, which has to exist on chain already.
+    /// Without it, the CLI refuses to send a payout it can't place, because a private address
+    /// paid publicly would land in a public account nobody can sign for.
     #[arg(long)]
     public_payee: bool,
 }
@@ -84,16 +74,9 @@ enum Command {
     JobAccount(JobArgs),
     /// Print a job's record and the balance it holds.
     Show(JobArgs),
-    /// Make a fresh private payout address under one of the wallet's private accounts' keys.
-    /// Prints the account id to use in `open`, and writes its key file to `--out`. Keep that file:
-    /// claiming or refunding to a fresh address needs it.
-    PayoutAddress {
-        /// The wallet's private account whose keys own the address.
-        #[arg(long)]
-        owner: AccountId,
-        #[arg(long)]
-        out: PathBuf,
-    },
+    /// Make a fresh private payout address: a new private account in this wallet. Prints its id,
+    /// to give as `--pay-to` or `--refund-to`.
+    PayoutAddress,
     /// Buyer: lock `amount` for `provider` until `deadline_ms` (or `in_secs` from now).
     Open {
         #[command(flatten)]
@@ -112,10 +95,14 @@ enum Command {
         deadline_ms: Option<u64>,
         #[arg(long)]
         in_secs: Option<u64>,
-        /// A program that may release and return the job besides the parties. On a controlled
-        /// job, delivering releases nothing; the controller decides.
-        #[arg(long)]
+        /// The program whose actor may release and return the job besides the parties, by
+        /// deciding at the job. On a controlled job, delivering releases nothing; the controller
+        /// decides.
+        #[arg(long, requires = "controller_account")]
         controller: Option<AccountId>,
+        /// The account of that actor: the one the controller program decides from.
+        #[arg(long, requires = "controller")]
+        controller_account: Option<AccountId>,
     },
     /// Provider: record the result hash before the deadline.
     Deliver {
@@ -145,73 +132,16 @@ fn parse_hash(text: &str) -> Result<Hash32> {
     <Hash32>::try_from(bytes).map_err(|_| anyhow::anyhow!("expected 32 bytes"))
 }
 
-/// A private account that only its owner's keys can spend, given out so another party can pay
-/// into it once.
-struct PayoutAddress {
-    npk: NullifierPublicKey,
-    vpk: ViewingPublicKey,
-    identifier: Identifier,
-}
-
-impl PayoutAddress {
-    fn account_id(&self) -> AccountId {
-        AccountId::for_regular_private_account(&self.npk, &self.vpk, self.identifier)
-    }
-
-    /// Three hex lines: the nullifier public key, the viewing public key, the identifier.
-    fn to_file(&self) -> String {
-        format!(
-            "{}\n{}\n{}\n",
-            hex::encode(self.npk.0),
-            hex::encode(self.vpk.to_bytes()),
-            hex::encode(self.identifier.value())
-        )
-    }
-
-    fn from_file(path: &PathBuf) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read payout address {}", path.display()))?;
-        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-        let mut next = |what: &str| {
-            lines
-                .next()
-                .with_context(|| format!("payout address file is missing the {what}"))
-        };
-        let npk = NullifierPublicKey(
-            hex::decode(next("nullifier public key")?)?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("nullifier public key must be 32 bytes"))?,
-        );
-        let vpk = ViewingPublicKey::from_bytes(hex::decode(next("viewing public key")?)?)
-            .map_err(|error| anyhow::anyhow!("viewing public key: {error}"))?;
-        let identifier = Identifier::new(
-            hex::decode(next("identifier")?)?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("identifier must be 32 bytes"))?,
-        );
-        Ok(Self {
-            npk,
-            vpk,
-            identifier,
-        })
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let program = match args.program {
-        Some(program) => program,
-        None => std::env::var("LOGOS_ESCROW_PROGRAM")
-            .unwrap_or_else(|_| TESTNET_PROGRAM.to_owned())
-            .parse()
-            .context("LOGOS_ESCROW_PROGRAM is not a base58 program id")?,
-    };
     let force = args.force;
     let wallet = WalletCore::from_env().context("open the wallet at LEE_WALLET_HOME_DIR")?;
     let mut escrow = Escrow {
         wallet,
-        program,
+        program: args
+            .program
+            .context("set --program or LOGOS_PROGRAM_ESCROW to the escrow's program id")?,
         payer: args.payer,
         elf: args.elf,
     };
@@ -219,27 +149,10 @@ async fn main() -> Result<()> {
     match args.command {
         Command::JobAccount(job) => println!("{}", escrow.job_account(&job)),
         Command::Show(job) => escrow.show(&job).await?,
-        Command::PayoutAddress { owner, out } => {
-            let found = escrow
-                .wallet
-                .storage()
-                .key_chain()
-                .private_account(owner)
-                .with_context(|| format!("{owner} is not one of this wallet's private accounts"))?;
-            let address = PayoutAddress {
-                npk: found.key_chain.nullifier_public_key,
-                vpk: found.key_chain.viewing_public_key.clone(),
-                identifier: wallet::cli::identifier_or_random(None),
-            };
-            // The identifier exists only in this file, and a fresh address can't be claimed to
-            // without it, so never overwrite another job's address.
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&out)
-                .with_context(|| format!("create {} (it must not exist yet)", out.display()))?;
-            std::io::Write::write_all(&mut file, address.to_file().as_bytes())?;
-            println!("{}", address.account_id());
+        Command::PayoutAddress => {
+            let (account_id, _) = escrow.wallet.create_new_account_private(None);
+            escrow.wallet.store_persistent_data()?;
+            println!("{account_id}");
         }
         Command::Open {
             job,
@@ -250,7 +163,11 @@ async fn main() -> Result<()> {
             deadline_ms,
             in_secs,
             controller,
+            controller_account,
         } => {
+            let controller = controller
+                .zip(controller_account)
+                .map(|(program, account)| Actor::new(account, program));
             let deadline = match (deadline_ms, in_secs) {
                 (Some(deadline), _) => deadline,
                 (None, Some(secs)) => secs
@@ -269,20 +186,17 @@ async fn main() -> Result<()> {
                 controller,
             };
             let job_account = escrow.job_account(&job);
-            let exists = !escrow
-                .wallet
-                .get_account_public(job_account)
-                .await?
-                .data
-                .shard(escrow.program)
-                .is_empty();
+            let exists = escrow.job_record(&job).await?.is_some();
             check(
                 force,
                 open_preflight(&instruction, job.buyer, job_account, exists, now_ms()?),
             )?;
+            let buyer = escrow.signer(job.buyer);
             let accounts = vec![
-                escrow.signs(job.buyer),
-                escrow.mention(escrow.job_account(&job)),
+                buyer.clone().select_program_actor_state(escrow.program),
+                escrow.job(&job),
+                buyer.balance(),
+                AccountIdentity::PublicNoSign(job_account).balance(),
             ];
             escrow.send(&job, accounts, &instruction).await?;
         }
@@ -290,17 +204,16 @@ async fn main() -> Result<()> {
             let record = escrow.record(&job).await?;
             check(force, preflight(&Call::Deliver, &record, now_ms()?))?;
             let instruction = Instruction::Deliver {
+                buyer: job.buyer,
+                job_ref: job.job_ref,
                 result,
                 deadline: record.deadline,
             };
-            let accounts = vec![
-                escrow.signs(record.provider),
-                escrow.mention(escrow.job_account(&job)),
-            ];
+            let accounts = vec![escrow.party(record.provider), escrow.job(&job)];
             escrow.send(&job, accounts, &instruction).await?;
         }
         Command::Claim(payout) => {
-            // Sync first, so a payout address someone already paid into is used as the wallet's own.
+            // Sync first, so a payout address someone already paid into is up to date.
             escrow.wallet.sync_to_latest_block().await?;
             let record = escrow.record(&payout.job).await?;
             check(force, preflight(&Call::Claim, &record, now_ms()?))?;
@@ -320,10 +233,7 @@ async fn main() -> Result<()> {
                 job_ref: job.job_ref,
                 amount,
             };
-            let accounts = vec![
-                escrow.signs(job.buyer),
-                escrow.mention(escrow.job_account(&job)),
-            ];
+            let accounts = vec![escrow.party(job.buyer), escrow.job(&job)];
             escrow.send(&job, accounts, &instruction).await?;
         }
         Command::Refund(payout) => {
@@ -346,11 +256,12 @@ async fn main() -> Result<()> {
         Command::Return(job) => {
             let record = escrow.record(&job).await?;
             check(force, preflight(&Call::Return, &record, now_ms()?))?;
-            let accounts = vec![
-                escrow.signs(record.provider),
-                escrow.mention(escrow.job_account(&job)),
-            ];
-            escrow.send(&job, accounts, &Instruction::Return).await?;
+            let instruction = Instruction::Return {
+                buyer: job.buyer,
+                job_ref: job.job_ref,
+            };
+            let accounts = vec![escrow.party(record.provider), escrow.job(&job)];
+            escrow.send(&job, accounts, &instruction).await?;
         }
     }
     Ok(())
@@ -367,9 +278,8 @@ enum Call {
 }
 
 /// Why the escrow, or LEZ's deadline window, would refuse `call` on `record` at `now` (in
-/// milliseconds). A refused public call is still included and charged, and one outside the
-/// deadline window pays its whole gas limit, so the CLI checks before it sends. The clock is
-/// this machine's, which can differ a little from the block's.
+/// milliseconds), so the CLI can say why before it sends. The clock is this machine's, which can
+/// differ a little from the block's.
 fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
     let open = record.state == JobState::Open;
     match call {
@@ -382,10 +292,9 @@ fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
                 ""
             }
         )),
-        Call::Deliver if now >= record.deadline => Err(
-            "the deadline has passed, so LEZ would refuse the call and charge its whole gas limit"
-                .into(),
-        ),
+        Call::Deliver if now >= record.deadline => {
+            Err("the deadline has passed, so LEZ would refuse the call".into())
+        }
         Call::Claim if record.claimable() == 0 => Err("nothing is released and unclaimed".into()),
         Call::Release(_) if !open => Err(format!(
             "only an open job can be released: it is {:?}",
@@ -397,11 +306,9 @@ fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
         Call::Refund if !matches!(record.state, JobState::Open | JobState::Returned) => Err(
             format!("the job can't be refunded: it is {:?}", record.state),
         ),
-        Call::Refund if open && now < record.deadline => Err(
-            "the deadline hasn't passed, so LEZ would refuse the call and charge its whole gas \
-             limit"
-                .into(),
-        ),
+        Call::Refund if open && now < record.deadline => {
+            Err("the deadline hasn't passed, so LEZ would refuse the call".into())
+        }
         Call::Refund if record.unreleased() == 0 => Err("nothing is left to refund".into()),
         Call::Return if !open => Err(format!(
             "only an open job can be returned: it is {:?}",
@@ -415,7 +322,7 @@ fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
 }
 
 /// Why the escrow, or LEZ's deadline window, would refuse `open` for `buyer` at `now`, with
-/// `exists` saying whether `job` already holds a job. The terms check is the one `plan` makes
+/// `exists` saying whether `job` already holds a job. The terms check is the one `Open` makes
 /// in `core`.
 fn open_preflight(
     open: &Instruction,
@@ -448,10 +355,7 @@ fn open_preflight(
         return Err("the job account can't be a payout address".into());
     }
     if now >= *deadline {
-        return Err(
-            "the deadline has passed, so LEZ would refuse the call and charge its whole gas limit"
-                .into(),
-        );
+        return Err("the deadline has passed, so LEZ would refuse the call".into());
     }
     Ok(())
 }
@@ -470,108 +374,102 @@ fn now_ms() -> Result<u64> {
     )?)
 }
 
-struct Escrow {
-    wallet: WalletCore,
+struct Escrow<C: WalletSequencerClient> {
+    wallet: WalletCore<C>,
     program: AccountId,
     payer: Option<AccountId>,
     elf: PathBuf,
 }
 
-impl Escrow {
+impl<C: WalletSequencerClient> Escrow<C> {
     fn job_account(&self, job: &JobArgs) -> AccountId {
         job_account_id(&self.program, &job.buyer, &job.job_ref)
     }
 
-    /// The signer: one of the wallet's private accounts if it holds one with this id, otherwise a
-    /// public account. Every account selects the escrow program's shard; the program builds the
-    /// native-balance selectors for the transfers it chains.
-    fn signs(&self, account_id: AccountId) -> AccountMention {
-        let private = self
-            .wallet
-            .storage()
-            .key_chain()
-            .private_account(account_id)
-            .is_some();
-        let identity = if private {
+    /// A signer: one of the wallet's private accounts if it holds one with this id, otherwise a
+    /// public account.
+    fn signer(&self, account_id: AccountId) -> AccountIdentity {
+        if self.is_private(account_id) {
             AccountIdentity::PrivateOwned(account_id)
         } else {
             AccountIdentity::Public(account_id)
-        };
-        AccountMention {
-            identity,
-            program_account_id: self.program,
         }
     }
 
-    /// An account named without signing, selecting the escrow program's shard.
-    fn mention(&self, account_id: AccountId) -> AccountMention {
-        AccountMention {
-            identity: AccountIdentity::PublicNoSign(account_id),
-            program_account_id: self.program,
-        }
+    fn is_private(&self, account_id: AccountId) -> bool {
+        self.wallet
+            .storage()
+            .key_chain()
+            .private_account(account_id)
+            .is_some()
     }
 
-    /// The signer, the job account and, unless the job pays the signer itself, the payee.
+    /// The party's own actor under the escrow, where it sends its instruction.
+    fn party(&self, account_id: AccountId) -> AccountMention {
+        self.signer(account_id)
+            .select_program_actor_state(self.program)
+    }
+
+    /// The job's actor under the escrow, which holds its record.
+    fn job(&self, job: &JobArgs) -> AccountMention {
+        AccountIdentity::PublicNoSign(self.job_account(job))
+            .select_program_actor_state(self.program)
+    }
+
+    /// The signer's actor, the job's, and both native balances a payout moves between.
     fn payout_accounts(
         &self,
         payout: &PayoutArgs,
         signer: AccountId,
         payee: AccountId,
     ) -> Result<Vec<AccountMention>> {
-        let mut accounts = vec![
-            self.signs(signer),
-            self.mention(self.job_account(&payout.job)),
-        ];
-        if payee != signer {
-            accounts.push(self.payee(payee, payout)?);
-        }
+        let mut accounts = vec![self.party(signer), self.job(&payout.job)];
+        accounts.push(AccountIdentity::PublicNoSign(self.job_account(&payout.job)).balance());
+        // The wallet names one account by one identity in a transaction, so a signer paid to
+        // itself keeps its signer's, and a fee payer paid keeps its signing one.
+        accounts.push(if payee == signer || Some(payee) == self.payer {
+            self.signer(payee).balance()
+        } else {
+            self.payee(payee, payout)?
+        });
         Ok(accounts)
     }
 
-    /// The payout address, as the account kind the wallet can pay into: one of its own private
-    /// accounts, a fresh private account from an address file, or a public account.
+    /// The payout address's native balance, as the account kind the wallet can pay into: one of
+    /// its own private accounts, or a public account. LEZ admits a public account the chain has
+    /// never seen only with its key, which the wallet adds for the accounts it holds.
     fn payee(&self, payee: AccountId, payout: &PayoutArgs) -> Result<AccountMention> {
         let key_chain = self.wallet.storage().key_chain();
-        let identity = if key_chain.private_account(payee).is_some() {
-            AccountIdentity::PrivateOwned(payee)
-        } else if let Some(path) = &payout.payee_address {
-            let address = PayoutAddress::from_file(path)?;
-            if address.account_id() != payee {
-                bail!(
-                    "{} is the address {}, but the job pays {payee}",
-                    path.display(),
-                    address.account_id()
-                );
-            }
-            AccountIdentity::PrivateForeign {
-                npk: address.npk,
-                vpk: address.vpk,
-                kind: PrivateAccountKind::Regular(address.identifier),
-            }
+        if self.is_private(payee) {
+            Ok(AccountIdentity::PrivateOwned(payee).balance().receiving())
         } else if payout.public_payee || key_chain.pub_account_signing_key(payee).is_some() {
-            AccountIdentity::PublicNoSign(payee)
+            Ok(AccountIdentity::PublicNoSign(payee).balance())
         } else {
             bail!(
-                "can't tell what kind of account {payee} is: pass --payee-address for a private \
-                 payout address, or --public-payee for a public account"
-            );
-        };
-        Ok(AccountMention {
-            identity,
-            program_account_id: self.program,
-        })
+                "can't tell what kind of account {payee} is: pull a payout from the wallet that \
+                 holds it, or pass --public-payee for a public account already on chain"
+            )
+        }
     }
 
-    async fn record(&self, job: &JobArgs) -> Result<Job> {
+    /// The job's record, or `None` when its account holds none.
+    async fn job_record(&self, job: &JobArgs) -> Result<Option<Job>> {
         let account = self
             .wallet
             .get_account_public(self.job_account(job))
-            .await?;
-        let shard = account.data.shard(self.program);
-        if shard.is_empty() {
-            bail!("no job at {}", self.job_account(job));
+            .await?
+            .unwrap_or_default();
+        let state = account.data.actor_state(self.program);
+        if state.is_empty() {
+            return Ok(None);
         }
-        Ok(borsh::from_slice(shard)?)
+        Ok(Some(borsh::from_slice(state)?))
+    }
+
+    async fn record(&self, job: &JobArgs) -> Result<Job> {
+        self.job_record(job)
+            .await?
+            .with_context(|| format!("no job at {}", self.job_account(job)))
     }
 
     async fn show(&self, job: &JobArgs) -> Result<()> {
@@ -600,21 +498,26 @@ impl Escrow {
             self.wallet.sync_to_latest_block().await?;
             let elf = std::fs::read(&self.elf)
                 .with_context(|| format!("read the escrow binary at {}", self.elf.display()))?;
-            let program = ProgramWithDependencies::new(
-                Program::new(elf.into())?,
-                self.program,
-                HashMap::new(),
-            );
+            let programs = ProgramCatalog::from([(self.program, Program::new(elf.into())?)]);
             println!("proving locally...");
             let (hash, _) = self
                 .wallet
-                .send_privacy_preserving_tx(accounts, data, &program)
+                .send_tx_with_pre_check(
+                    accounts,
+                    PARTY_ACTOR,
+                    data,
+                    &programs,
+                    None,
+                    AsyncDelivery::default(),
+                    self.payer,
+                    |_| Ok(()),
+                )
                 .await
                 .map_err(|error| anyhow::anyhow!("send failed: {error:?}"))?;
             hash
         } else {
             self.wallet
-                .send_pub_tx_paid_by(accounts, data, self.program, self.payer)
+                .send_pub_tx_paid_by(accounts, PARTY_ACTOR, data, self.payer)
                 .await
                 .map_err(|error| anyhow::anyhow!("send failed: {error:?}"))?
         };
@@ -629,7 +532,7 @@ impl Escrow {
             self.wallet.sync_to_latest_block().await?;
             self.wallet.store_persistent_data()?;
         }
-        // A public call that was refused is still included and charged, so read the record back.
+        // Inclusion alone doesn't say what the call did, so read the record back.
         self.show(job).await
     }
 }
@@ -754,55 +657,5 @@ mod tests {
         assert!(preflight(&Call::Deliver, &controlled_and_delivered, DEADLINE - 1).is_err());
         let refunded = record(JobState::Refunded, 0, 0);
         assert!(preflight(&Call::Refund, &refunded, DEADLINE).is_err());
-    }
-
-    fn address() -> PayoutAddress {
-        PayoutAddress {
-            npk: NullifierPublicKey([1; 32]),
-            vpk: ViewingPublicKey::from_bytes(vec![2; 1184]).expect("1184-byte key"),
-            identifier: Identifier::new([3; 32]),
-        }
-    }
-
-    fn written(name: &str, text: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "logos-escrow-test-{}-{name}.addr",
-            std::process::id()
-        ));
-        std::fs::write(&path, text).expect("write the address file");
-        path
-    }
-
-    #[test]
-    fn a_payout_address_file_round_trips_to_the_same_account() {
-        let path = written("round-trip", &address().to_file());
-        let read = PayoutAddress::from_file(&path).expect("reads back");
-        std::fs::remove_file(&path).ok();
-        assert_eq!(read.account_id(), address().account_id());
-        assert_eq!(read.identifier, address().identifier);
-    }
-
-    /// Computed independently: SHA-256 of the 32-byte prefix, npk, vpk and identifier, with
-    /// Python's `hashlib`.
-    #[test]
-    fn the_address_is_the_lez_private_account_id_of_its_keys() {
-        assert_eq!(
-            address().account_id().to_string(),
-            "9aook7Yh6sHfiPGHwWS2AG3HEhbKZAtaWj8TryeZRfhv"
-        );
-    }
-
-    #[test]
-    fn a_truncated_address_file_is_refused() {
-        let full = address().to_file();
-        let two_lines: String = full
-            .lines()
-            .take(2)
-            .map(|line| format!("{line}\n"))
-            .collect();
-        let path = written("truncated", &two_lines);
-        let read = PayoutAddress::from_file(&path);
-        std::fs::remove_file(&path).ok();
-        assert!(read.is_err());
     }
 }

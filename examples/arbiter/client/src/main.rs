@@ -6,10 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
-use lee_core::account::{AccountId, Balance};
+use lee_core::account::{AccountId, Actor, Balance};
 use logos_escrow_arbiter::{ArbiterInstruction, Case, Decision, case_account_id};
 use logos_escrow_core::{Hash32, Job, job_account_id};
-use wallet::{AccountIdentity, AccountMention, WalletCore};
+use wallet::{AccountIdentity, AccountMention, WalletCore, WalletSequencerClient};
+
+/// Where the instruction goes: the first account given, the signer's own actor under the arbiter.
+const SIGNER_ACTOR: usize = 0;
 
 #[derive(Parser)]
 #[command(about = "Drive the example arbiter from a LEZ wallet")]
@@ -117,71 +120,72 @@ async fn main() -> Result<()> {
                 amount,
                 deadline: now + in_secs * 1000,
             };
-            client.send(&job, job.buyer, &[], &open).await
+            // The buyer's escrow actor and both native balances, for the escrow's Open.
+            let job_account = client.job_account(&job);
+            // The wallet names one account by one identity in a transaction: the buyer signs.
+            let more = vec![
+                AccountIdentity::Public(job.buyer).select_program_actor_state(escrow),
+                AccountIdentity::Public(job.buyer).balance(),
+                AccountIdentity::PublicNoSign(job_account).balance(),
+            ];
+            client.send(&job, job.buyer, more, &open).await
         }
         Command::Release { job, judge, amount } => {
             let decide = ArbiterInstruction::Decide {
                 escrow,
-                decision: Decision::Release {
-                    job_ref: job.job_ref,
-                    amount,
-                },
+                buyer: job.buyer,
+                job_ref: job.job_ref,
+                decision: Decision::Release { amount },
             };
-            client.send(&job, judge, &[job.buyer], &decide).await
+            let party = AccountIdentity::PublicNoSign(job.buyer).select_program_actor_state(escrow);
+            client.send(&job, judge, vec![party], &decide).await
         }
         Command::Show { job } => client.show(&job).await,
         Command::Return { job, judge } => {
             let provider = client.job(&job).await?.provider;
             let decide = ArbiterInstruction::Decide {
                 escrow,
+                buyer: job.buyer,
+                job_ref: job.job_ref,
                 decision: Decision::Return,
             };
-            client.send(&job, judge, &[provider], &decide).await
+            let party = AccountIdentity::PublicNoSign(provider).select_program_actor_state(escrow);
+            client.send(&job, judge, vec![party], &decide).await
         }
     }
 }
 
-struct Client {
-    wallet: WalletCore,
+struct Client<C: WalletSequencerClient> {
+    wallet: WalletCore<C>,
     arbiter: AccountId,
     escrow: AccountId,
 }
 
-impl Client {
+impl<C: WalletSequencerClient> Client<C> {
     fn job_account(&self, job: &JobArgs) -> AccountId {
         job_account_id(&self.escrow, &job.buyer, &job.job_ref)
     }
 
-    /// Sends one arbiter call signed by `signer`. Its accounts are the signer, the case, `party`
-    /// for a decision, then the job.
+    /// Sends one arbiter call to `signer`'s own actor under the arbiter, declaring the case, the
+    /// job and `more`.
     async fn send(
         &self,
         job: &JobArgs,
         signer: AccountId,
-        party: &[AccountId],
+        more: Vec<AccountMention>,
         instruction: &ArbiterInstruction,
     ) -> Result<()> {
         let job_account = self.job_account(job);
-        let mention = |identity| AccountMention {
-            identity,
-            program_account_id: self.arbiter,
-        };
         let mut accounts = vec![
-            mention(AccountIdentity::Public(signer)),
-            mention(AccountIdentity::PublicNoSign(case_account_id(
-                &self.arbiter,
-                &job_account,
-            ))),
+            AccountIdentity::Public(signer).select_program_actor_state(self.arbiter),
+            AccountIdentity::PublicNoSign(case_account_id(&self.arbiter, &job_account))
+                .select_program_actor_state(self.arbiter),
+            AccountIdentity::PublicNoSign(job_account).select_program_actor_state(self.escrow),
         ];
-        accounts.extend(
-            party
-                .iter()
-                .map(|id| mention(AccountIdentity::PublicNoSign(*id))),
-        );
-        accounts.push(mention(AccountIdentity::PublicNoSign(job_account)));
+        accounts.extend(more);
         let hash = self
             .wallet
-            .send_pub_tx_paid_by(accounts, borsh::to_vec(instruction)?, self.arbiter, None)
+            .send_pub_tx(accounts, SIGNER_ACTOR, borsh::to_vec(instruction)?)
             .await
             .map_err(|error| anyhow::anyhow!("send failed: {error:?}"))?;
         let (_, block) = self
@@ -207,8 +211,9 @@ impl Client {
             .wallet
             .get_account_public(case_account)
             .await?
+            .unwrap_or_default()
             .data
-            .shard(self.arbiter)
+            .actor_state(self.arbiter)
             .to_vec();
         let record = self.job(job).await?;
         if shard.is_empty() {
@@ -218,7 +223,11 @@ impl Client {
             );
         }
         let case: Case = borsh::from_slice(&shard)?;
-        if case.escrow != self.escrow || record.controller != Some(self.arbiter) {
+        // The arbiter calls the escrow a case names with the judge's signature, so a judge
+        // decides only cases that name the real one.
+        if case.escrow != self.escrow
+            || record.controller != Some(Actor::new(case_account, self.arbiter))
+        {
             bail!("the case or the job names another escrow or controller: don't work on it");
         }
         println!("judge {}", case.judge);
@@ -239,11 +248,12 @@ impl Client {
         let account = self
             .wallet
             .get_account_public(self.job_account(job))
-            .await?;
-        let shard = account.data.shard(self.escrow);
-        if shard.is_empty() {
+            .await?
+            .unwrap_or_default();
+        let state = account.data.actor_state(self.escrow);
+        if state.is_empty() {
             bail!("no job at {}", self.job_account(job));
         }
-        Ok(borsh::from_slice(shard)?)
+        Ok(borsh::from_slice(state)?)
     }
 }

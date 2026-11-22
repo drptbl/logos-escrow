@@ -1,38 +1,15 @@
-//! The escrow program's zkVM entry point. The rules live in `logos_escrow_core`; this only reads
-//! the runtime's call, runs `plan` or `apply`, and writes the result.
+//! The escrow program's zkVM entry point. The rules live in `logos_escrow_core`; this only runs
+//! its handler on the message LEZ delivers and writes the result.
 //!
 //! A refused call exits with the error's code instead of panicking: LEZ charges a non-zero exit
-//! only for the cycles it used, but a panic for the transaction's whole gas limit.
+//! only for the cycles it used, but a panic for the transaction's whole cycle budget.
 
-use lee_core::program::{ApplyInput, CallKind, PlanInput, apply_write, read_input_frame};
-use logos_escrow_core::EscrowError;
+use lee_core::program::{ReceiveInput, Response};
 use risc0_zkvm::guest::env;
 
-fn main() {
-    // Both frames come from the LEZ runtime, not from the caller.
-    let call_kind: CallKind =
-        borsh::from_slice(&read_input_frame()).expect("the runtime writes a call kind");
-    let payload = read_input_frame();
-    match call_kind {
-        CallKind::Plan => {
-            let input: PlanInput =
-                borsh::from_slice(&payload).expect("the runtime writes a plan input");
-            match logos_escrow_core::plan(&input) {
-                Ok(plan) => plan.write(),
-                Err(error) => refuse(error),
-            }
-        }
-        CallKind::Apply => {
-            let input: ApplyInput =
-                borsh::from_slice(&payload).expect("the runtime writes an apply input");
-            match logos_escrow_core::apply(&input) {
-                Ok(record) => apply_write(input, record),
-                Err(error) => refuse(error),
-            }
-        }
-    }
-}
+// Raw, so a message that doesn't decode exits with its code too.
+lee_core::actor_entrypoint!(raw handle);
 
-fn refuse(error: EscrowError) -> ! {
-    env::exit(error.code())
+fn handle(input: &ReceiveInput) -> Response {
+    logos_escrow_core::handle(input).unwrap_or_else(|error| env::exit(error.code()))
 }
