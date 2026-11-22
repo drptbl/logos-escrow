@@ -118,6 +118,21 @@ An `Actor` is its account then its program, 32 bytes each.
    0404040404040404040404040404040404040404040404040404040404040404 00505c18a3010000
 ```
 
+## Events
+
+Every change to a job emits one event from the job's actor, a LEZ `ProgramEvent`: an 8-byte selector, the first 8 bytes of `sha256("logos_escrow::<Event>")`, and the event's Borsh data. `core/src/events.rs` has the types.
+
+| Event | Selector | Data |
+| --- | --- | --- |
+| `Opened` | `bd302df617c1685f` | `job`, `buyer`, `provider`, `amount: u128`, `deadline: u64`, `controller: Option<Actor>` |
+| `Delivered` | `a0cf04b66d2e0687` | `job`, `result: [u8; 32]` |
+| `Released` | `95d8eff8ea992b74` | `job`, `amount: u128` |
+| `Claimed` | `5273036ec2490250` | `job`, `to`, `amount: u128` |
+| `Returned` | `a5eff4ddf518f44f` | `job` |
+| `Refunded` | `604c2adf6947f950` | `job`, `to`, `amount: u128` |
+
+Account ids are 32 bytes. A refused call emits nothing.
+
 ## Reading a job
 
 The record is the escrow's state on the job account, `Actor(job, escrow)`, and there is no job while it's empty. The locked lepta are the native token's state on the same account, a 16-byte little-endian `u128`, empty at zero.
