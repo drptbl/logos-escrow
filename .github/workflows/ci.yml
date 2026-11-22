@@ -54,3 +54,11 @@ jobs:
         run: make build
       # Every flow through the built guests on LEZ's own state machine.
       - run: cargo test -p logos_escrow_integration
+      # Every flow on a local LEZ v0.4 chain, through the CLI and the LEZ wallet, with public and
+      # private parties and a controller. Starts the devnet from logos-devnet.toml and exports its
+      # env.
+      - uses: drptbl/logos-devnet@c586b2fa959fa884e001bbb1593b9f64d5de25ee # v0.10.0
+      - run: cargo test -p logos_escrow_cli --test devnet -- --ignored
+      - name: The sequencer's log
+        if: failure()
+        run: logos-devnet logs || true

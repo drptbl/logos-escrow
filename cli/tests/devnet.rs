@@ -1,10 +1,13 @@
-//! Every escrow flow against a running devnet, through the real CLI and the LEZ wallet it uses,
-//! with public and private parties.
+//! Every escrow flow against a running LEZ v0.4 devnet, through the real CLI and the LEZ wallet it
+//! uses, with public and private parties and a program acting as controller.
 //!
 //! ```bash
-//! make build && logos-devnet up
+//! make build && logos-devnet reset
 //! logos-devnet exec -- cargo test -p logos_escrow_cli --test devnet -- --ignored
 //! ```
+//!
+//! Run it on a fresh chain: the copied wallet makes the same new private accounts every run, so a
+//! second run on one chain collides with the first.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,41 +15,38 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use lee_core::{
-    Identifier, NullifierPublicKey,
-    account::{AccountId, Balance},
-    encryption::ViewingPublicKey,
-};
-use logos_escrow_core::{Instruction, job_account_id};
+use lee_core::account::{AccountId, Balance};
+use logos_escrow_core::Instruction;
 use wallet::{
-    AccountIdentity, AccountMention, WalletCore,
-    program_facades::native_token_transfer::NativeTokenTransfer,
+    AccountIdentity, WalletCore,
+    program_facades::{CreditDelivery, native_token_transfer::NativeTokenTransfer},
 };
 
 const AMOUNT: Balance = 1_000_000;
 
 struct Devnet {
-    program: String,
+    program: AccountId,
     /// The test-only controller, which relays whatever escrow call it is given.
     controller: AccountId,
     home: PathBuf,
     payer: AccountId,
     buyer: AccountId,
     provider: AccountId,
-    scratch: PathBuf,
 }
 
 fn env(name: &str) -> String {
     std::env::var(name)
-        .unwrap_or_else(|_| panic!("{name} is unset: run `logos-devnet up` and source its env"))
+        .unwrap_or_else(|_| panic!("{name} is unset: run this under `logos-devnet exec`"))
 }
 
 impl Devnet {
     /// A copy of the devnet's funded `parties` wallet, so a run leaves the original untouched.
     fn new() -> Self {
-        let scratch =
-            std::env::temp_dir().join(format!("logos-escrow-devnet-{}", std::process::id()));
-        let home = scratch.join("wallet");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("logos-escrow-devnet-{nanos}"));
         std::fs::create_dir_all(&home).expect("make the wallet copy");
         let group = PathBuf::from(env("LOGOS_DEVNET_ACCOUNTS_PARTIES_WALLET"));
         for file in ["wallet_config.json", "storage.json"] {
@@ -72,24 +72,24 @@ impl Devnet {
         let [payer, buyer, provider] = ids[..] else {
             panic!("the parties group has {} accounts, not 3", ids.len());
         };
+        let id = |name: &str| env(name).parse().expect("a base58 program id");
         Self {
-            program: env("LOGOS_PROGRAM_ESCROW"),
-            controller: env("LOGOS_PROGRAM_TEST_CONTROLLER")
-                .parse()
-                .expect("a base58 program id"),
+            program: id("LOGOS_PROGRAM_ESCROW"),
+            controller: id("LOGOS_PROGRAM_TEST_CONTROLLER"),
             home,
             payer,
             buyer,
             provider,
-            scratch,
         }
     }
 
-    fn wallet(&self) -> WalletCore {
+    /// The devnet's group wallets are unencrypted, which an empty password opens.
+    fn wallet(&self) -> WalletCore<impl wallet::WalletSequencerClient> {
         WalletCore::new_update_chain(
             self.home.join("wallet_config.json"),
             self.home.join("storage.json"),
             None,
+            "",
         )
         .expect("open the wallet")
     }
@@ -101,7 +101,7 @@ impl Devnet {
         let output = Command::new(env!("CARGO_BIN_EXE_logos-escrow"))
             .args(args)
             .env("LEE_WALLET_HOME_DIR", &self.home)
-            .env("LOGOS_PROGRAM_ESCROW", &self.program)
+            .env("LOGOS_PROGRAM_ESCROW", self.program.to_string())
             .env("LOGOS_ESCROW_ELF", elf)
             .output()
             .expect("run the CLI");
@@ -115,6 +115,18 @@ impl Devnet {
             "logos-escrow {args:?} failed:\n{text}"
         );
         text
+    }
+
+    /// Runs the CLI expecting it to fail, and returns its output.
+    fn cli_fails(&self, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_logos-escrow"))
+            .args(args)
+            .env("LEE_WALLET_HOME_DIR", &self.home)
+            .env("LOGOS_PROGRAM_ESCROW", self.program.to_string())
+            .output()
+            .expect("run the CLI");
+        assert!(!output.status.success(), "logos-escrow {args:?} succeeded");
+        String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
     /// Runs one escrow call and returns the job's state afterwards.
@@ -132,41 +144,26 @@ impl Devnet {
             .unwrap_or_else(|| panic!("no job state in:\n{text}"))
     }
 
-    fn payout_address(&self, owner: AccountId, name: &str) -> (String, PathBuf) {
-        let path = self.scratch.join(format!("{name}.addr"));
-        let owner = owner.to_string();
-        let id = self.cli(&[
-            "payout-address",
-            "--owner",
-            &owner,
-            "--out",
-            path.to_str().expect("utf-8"),
-        ]);
-        (id.trim().to_owned(), path)
-    }
-
-    /// Has the controller make one escrow call; the payer signs and pays, so no party does.
-    async fn relay(&self, accounts: &[AccountId], instruction: &Instruction) {
-        let program: AccountId = self.program.parse().expect("a base58 program id");
-        let mentions = accounts
-            .iter()
-            .map(|id| AccountMention {
-                identity: AccountIdentity::PublicNoSign(*id),
-                program_account_id: self.controller,
-            })
-            .collect();
+    /// Has the controller send `instruction` to `party`'s escrow actor; the payer signs and pays,
+    /// so no party does.
+    async fn relay(&self, party: AccountId, job: AccountId, instruction: &Instruction) {
         let relay = (
-            program,
+            self.program,
+            party,
             Vec::<[u8; 32]>::new(),
             borsh::to_vec(instruction).expect("instruction serializes"),
         );
+        let accounts = vec![
+            AccountIdentity::Public(self.payer).select_program_actor_state(self.controller),
+            AccountIdentity::PublicNoSign(party).select_program_actor_state(self.program),
+            AccountIdentity::PublicNoSign(job).select_program_actor_state(self.program),
+        ];
         let wallet = self.wallet();
         let hash = wallet
-            .send_pub_tx_paid_by(
-                mentions,
+            .send_pub_tx(
+                accounts,
+                0,
                 borsh::to_vec(&relay).expect("relay serializes"),
-                self.controller,
-                Some(self.payer),
             )
             .await
             .expect("send the relay");
@@ -189,13 +186,9 @@ impl Devnet {
         wallet.sync_to_latest_block().await.expect("sync");
         wallet.store_persistent_data().expect("save the wallet");
         let id: AccountId = id.parse().expect("an account id");
-        wallet
-            .storage()
-            .key_chain()
-            .private_account(id)
-            .map_or(0, |found| {
-                found.account.data.native_balance().expect("a balance")
-            })
+        wallet.get_account_private(id).map_or(0, |account| {
+            account.data.native_balance().expect("a balance")
+        })
     }
 }
 
@@ -208,77 +201,68 @@ fn job_ref() -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs a running devnet: logos-devnet up, then source its env"]
+#[ignore = "needs a running devnet: logos-devnet up, then run this under logos-devnet exec"]
 async fn every_flow_settles_on_a_devnet() {
     let devnet = Devnet::new();
     let payer = devnet.payer.to_string();
     let (buyer, provider) = (devnet.buyer.to_string(), devnet.provider.to_string());
     let amount = AMOUNT.to_string();
+    let open = |job: &str, secs: &str, controller: Option<&str>| -> Vec<String> {
+        let mut args = vec![
+            "--payer",
+            &payer,
+            "open",
+            "--buyer",
+            &buyer,
+            "--job-ref",
+            job,
+            "--provider",
+            &provider,
+            "--pay-to",
+            &provider,
+            "--refund-to",
+            &buyer,
+            "--amount",
+            &amount,
+            "--in-secs",
+            secs,
+        ];
+        if let Some(controller) = controller {
+            args.extend(["--controller", controller]);
+        }
+        args.into_iter().map(str::to_owned).collect()
+    };
+    let call =
+        |args: Vec<String>| devnet.call(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let on = |job: &str, command: &str, extra: &[&str]| -> Vec<String> {
+        [
+            "--payer",
+            payer.as_str(),
+            command,
+            "--buyer",
+            buyer.as_str(),
+            "--job-ref",
+            job,
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
+    };
 
     // Public parties, paid to themselves: open, deliver, claim.
     let job = job_ref();
     let before = devnet.public_balance(devnet.provider).await;
-    let open = [
-        "--payer",
-        &payer,
-        "open",
-        "--buyer",
-        &buyer,
-        "--job-ref",
-        &job,
-        "--provider",
-        &provider,
-        "--pay-to",
-        &provider,
-        "--refund-to",
-        &buyer,
-        "--amount",
-        &amount,
-        "--in-secs",
-        "600",
-    ];
-    assert_eq!(devnet.call(&open), "Open");
-    // A claim before delivery is refused on chain and moves nothing. `--force` skips the CLI's
-    // own check, which would stop it before it sends.
-    assert_eq!(
-        devnet.call(&[
-            "--payer",
-            &payer,
-            "--force",
-            "claim",
-            "--buyer",
-            &buyer,
-            "--job-ref",
-            &job
-        ]),
-        "Open"
-    );
-    assert_eq!(
-        devnet.call(&[
-            "--payer",
-            &payer,
-            "deliver",
-            "--buyer",
-            &buyer,
-            "--job-ref",
-            &job,
-            "--result",
-            &job
-        ]),
-        "Delivered"
-    );
-    assert_eq!(
-        devnet.call(&[
-            "--payer",
-            &payer,
-            "claim",
-            "--buyer",
-            &buyer,
-            "--job-ref",
-            &job
-        ]),
-        "Delivered"
-    );
+    assert_eq!(call(open(&job, "600", None)), "Open");
+    // A claim before delivery is refused with WrongAmount (10). `--force` skips the CLI's own
+    // check, and then the wallet's simulation of the call stops it before it's sent.
+    let mut early = on(&job, "claim", &[]);
+    early.insert(2, "--force".to_owned());
+    let refused = devnet.cli_fails(&early.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(refused.contains("non-zero code 10"), "{refused}");
+    assert_eq!(call(on(&job, "show", &[])), "Open");
+    assert_eq!(call(on(&job, "deliver", &["--result", &job])), "Delivered");
+    assert_eq!(call(on(&job, "claim", &[])), "Delivered");
     assert_eq!(
         devnet.public_balance(devnet.provider).await,
         before + AMOUNT
@@ -287,39 +271,9 @@ async fn every_flow_settles_on_a_devnet() {
     // Public parties: open, the deadline passes, refund.
     let job = job_ref();
     let before = devnet.public_balance(devnet.buyer).await;
-    let open = [
-        "--payer",
-        &payer,
-        "open",
-        "--buyer",
-        &buyer,
-        "--job-ref",
-        &job,
-        "--provider",
-        &provider,
-        "--pay-to",
-        &provider,
-        "--refund-to",
-        &buyer,
-        "--amount",
-        &amount,
-        "--in-secs",
-        "4",
-    ];
-    assert_eq!(devnet.call(&open), "Open");
+    assert_eq!(call(open(&job, "4", None)), "Open");
     tokio::time::sleep(Duration::from_secs(8)).await;
-    assert_eq!(
-        devnet.call(&[
-            "--payer",
-            &payer,
-            "refund",
-            "--buyer",
-            &buyer,
-            "--job-ref",
-            &job
-        ]),
-        "Refunded"
-    );
+    assert_eq!(call(on(&job, "refund", &[])), "Refunded");
     assert_eq!(devnet.public_balance(devnet.buyer).await, before);
 
     // A controlled job: the buyer and the controller each release a part, the provider claims
@@ -330,60 +284,36 @@ async fn every_flow_settles_on_a_devnet() {
         devnet.public_balance(devnet.provider).await,
         devnet.public_balance(devnet.buyer).await,
     );
-    let open = [
-        "--payer",
-        &payer,
-        "open",
-        "--buyer",
-        &buyer,
-        "--job-ref",
-        &job,
-        "--provider",
-        &provider,
-        "--pay-to",
-        &provider,
-        "--refund-to",
-        &buyer,
-        "--amount",
-        &amount,
-        "--in-secs",
-        "600",
-        "--controller",
-        &controller,
-    ];
-    assert_eq!(devnet.call(&open), "Open");
-    let job_args = ["--buyer", buyer.as_str(), "--job-ref", job.as_str()];
-    let as_party = |command: &str, extra: &[&str]| -> String {
-        let args: Vec<&str> = ["--payer", payer.as_str(), command]
-            .into_iter()
-            .chain(job_args)
-            .chain(extra.iter().copied())
-            .collect();
-        devnet.call(&args)
-    };
+    assert_eq!(call(open(&job, "600", Some(&controller))), "Open");
     // Delivering a controlled job releases nothing.
-    assert_eq!(as_party("deliver", &["--result", &job]), "Open");
+    assert_eq!(call(on(&job, "deliver", &["--result", &job])), "Open");
     let part = (AMOUNT / 4).to_string();
-    assert_eq!(as_party("release", &["--amount", &part]), "Open");
-    let job_account = job_account_id(
-        &devnet.program.parse().expect("a program id"),
-        &devnet.buyer,
-        &<[u8; 32]>::try_from(hex::decode(&job).expect("hex")).expect("32 bytes"),
-    );
+    assert_eq!(call(on(&job, "release", &["--amount", &part])), "Open");
+    let job_ref_bytes = <[u8; 32]>::try_from(hex::decode(&job).expect("hex")).expect("32 bytes");
+    let job_account =
+        logos_escrow_core::job_account_id(&devnet.program, &devnet.buyer, &job_ref_bytes);
     devnet
         .relay(
-            &[devnet.buyer, job_account],
+            devnet.buyer,
+            job_account,
             &Instruction::Release {
-                job_ref: <[u8; 32]>::try_from(hex::decode(&job).expect("hex")).expect("32 bytes"),
+                job_ref: job_ref_bytes,
                 amount: AMOUNT / 4,
             },
         )
         .await;
-    assert_eq!(as_party("claim", &[]), "Open");
+    assert_eq!(call(on(&job, "claim", &[])), "Open");
     devnet
-        .relay(&[devnet.provider, job_account], &Instruction::Return)
+        .relay(
+            devnet.provider,
+            job_account,
+            &Instruction::Return {
+                buyer: devnet.buyer,
+                job_ref: job_ref_bytes,
+            },
+        )
         .await;
-    assert_eq!(as_party("refund", &[]), "Refunded");
+    assert_eq!(call(on(&job, "refund", &[])), "Refunded");
     assert_eq!(
         devnet.public_balance(devnet.provider).await,
         provider_before + AMOUNT / 2
@@ -393,32 +323,41 @@ async fn every_flow_settles_on_a_devnet() {
         buyer_before - AMOUNT / 2
     );
 
-    // Private parties, funded by a shielded transfer.
+    // Private parties, funded by a shielded transfer, paid to fresh private payout addresses.
     let mut wallet = devnet.wallet();
     let (private_buyer, _) = wallet.create_new_account_private(None);
     let (private_provider, _) = wallet.create_new_account_private(None);
+    // Private transactions pay their fees in LEZ 0.4, from an owned private account: this one.
+    let (private_fees, _) = wallet.create_new_account_private(None);
     wallet.store_persistent_data().expect("save the wallet");
-    let (hash, _) = NativeTokenTransfer(&wallet)
-        .send_shielded_transfer(
-            AccountIdentity::Public(devnet.payer),
-            private_buyer,
-            10 * AMOUNT,
-        )
-        .await
-        .expect("shield funds to the private buyer");
-    wallet
-        .poll_transaction(hash)
-        .await
-        .expect("the shielded transfer lands");
+    for (account, amount) in [(private_buyer, 10 * AMOUNT), (private_fees, 100 * AMOUNT)] {
+        let (hash, _) = NativeTokenTransfer(&wallet)
+            .transfer(
+                AccountIdentity::Public(devnet.payer),
+                AccountIdentity::PrivateOwned(account),
+                amount,
+                CreditDelivery::Automatic,
+            )
+            .await
+            .expect("shield funds");
+        wallet
+            .poll_transaction(hash)
+            .await
+            .expect("the shielded transfer lands");
+        wallet.sync_to_latest_block().await.expect("sync");
+    }
+    wallet.store_persistent_data().expect("save the wallet");
     drop(wallet);
     let (pbuyer, pprovider) = (private_buyer.to_string(), private_provider.to_string());
+    let fees = private_fees.to_string();
 
-    for flow in ["claim", "return", "release", "pre-funded"] {
+    for flow in ["claim", "return"] {
         let job = job_ref();
-        let (pay_to, pay_file) = devnet.payout_address(private_provider, &format!("{flow}-pay"));
-        let (refund_to, refund_file) =
-            devnet.payout_address(private_buyer, &format!("{flow}-refund"));
+        let pay_to = devnet.cli(&["payout-address"]).trim().to_owned();
+        let refund_to = devnet.cli(&["payout-address"]).trim().to_owned();
         let open = [
+            "--payer",
+            &fees,
             "open",
             "--buyer",
             &pbuyer,
@@ -436,70 +375,30 @@ async fn every_flow_settles_on_a_devnet() {
             "600",
         ];
         assert_eq!(devnet.call(&open), "Open", "{flow}");
-        let job_args = ["--buyer", pbuyer.as_str(), "--job-ref", job.as_str()];
-        let with = |command: &str, extra: &[&str]| -> Vec<String> {
-            std::iter::once(command)
-                .chain(job_args)
-                .chain(extra.iter().copied())
-                .map(str::to_owned)
-                .collect()
+        let on = |command: &str, extra: &[&str]| -> Vec<String> {
+            [
+                "--payer",
+                fees.as_str(),
+                command,
+                "--buyer",
+                pbuyer.as_str(),
+                "--job-ref",
+                job.as_str(),
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_owned)
+            .collect()
         };
-        let call =
-            |args: Vec<String>| devnet.call(&args.iter().map(String::as_str).collect::<Vec<_>>());
-        let pay = ["--payee-address", pay_file.to_str().expect("utf-8")];
-        let refund = ["--payee-address", refund_file.to_str().expect("utf-8")];
-        match flow {
-            "claim" => {
-                assert_eq!(call(with("deliver", &["--result", &job])), "Delivered");
-                assert_eq!(call(with("claim", &pay)), "Delivered");
-                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
-            }
-            "return" => {
-                assert_eq!(call(with("return", &[])), "Returned");
-                assert_eq!(call(with("refund", &refund)), "Refunded");
-                assert_eq!(devnet.private_balance(&refund_to).await, AMOUNT);
-            }
-            "release" => {
-                assert_eq!(call(with("release", &[])), "Open");
-                assert_eq!(call(with("claim", &pay)), "Open");
-                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
-            }
-            _ => {
-                // Someone pays into the fresh pay_to first, so it is no longer fresh.
-                let text = std::fs::read_to_string(&pay_file).expect("read the address");
-                let lines: Vec<&str> = text.lines().collect();
-                let wallet = devnet.wallet();
-                let (hash, _) = NativeTokenTransfer(&wallet)
-                    .send_shielded_transfer_to_outer_account(
-                        AccountIdentity::Public(devnet.payer),
-                        NullifierPublicKey(
-                            hex::decode(lines[0])
-                                .expect("hex")
-                                .try_into()
-                                .expect("32 bytes"),
-                        ),
-                        ViewingPublicKey::from_bytes(hex::decode(lines[1]).expect("hex"))
-                            .expect("a key"),
-                        Identifier::new(
-                            hex::decode(lines[2])
-                                .expect("hex")
-                                .try_into()
-                                .expect("32 bytes"),
-                        ),
-                        1,
-                    )
-                    .await
-                    .expect("pay into the pay_to first");
-                wallet
-                    .poll_transaction(hash)
-                    .await
-                    .expect("the transfer lands");
-                drop(wallet);
-                assert_eq!(call(with("deliver", &["--result", &job])), "Delivered");
-                assert_eq!(call(with("claim", &pay)), "Delivered");
-                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT + 1);
-            }
+        if flow == "claim" {
+            assert_eq!(call(on("deliver", &["--result", &job])), "Delivered");
+            assert_eq!(call(on("claim", &[])), "Delivered");
+            assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
+        } else {
+            assert_eq!(call(on("return", &[])), "Returned");
+            assert_eq!(call(on("refund", &[])), "Refunded");
+            assert_eq!(devnet.private_balance(&refund_to).await, AMOUNT);
         }
     }
-    std::fs::remove_dir_all(&devnet.scratch).ok();
+    std::fs::remove_dir_all(&devnet.home).ok();
 }

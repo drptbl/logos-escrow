@@ -28,7 +28,8 @@ struct Args {
     /// still pays for.
     #[arg(long, global = true)]
     force: bool,
-    /// A wallet account that pays the transaction's fee; by default the signer pays.
+    /// A wallet account that pays the transaction's fee; by default the signer pays. A private
+    /// call pays its fee in the proof, from one of the wallet's private accounts.
     #[arg(long, global = true)]
     payer: Option<AccountId>,
     /// The escrow guest binary, which a private call proves locally.
