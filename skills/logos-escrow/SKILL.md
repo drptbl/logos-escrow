@@ -13,11 +13,15 @@ description: Integrate the logos-escrow job escrow on the Logos Execution Zone (
 2. Derive the job account from the buyer and a 32-byte `job_ref` (README, Job account). A `job_ref` is spent for that buyer once opened, so make each one fresh.
 3. Before every call after `Open`, read the job record (README, Reading a job) and quote it: `Deliver` takes the record's `deadline`, `Claim` at most `released - claimed`, and `Refund` exactly `amount - released`, with `deadline` 0 after a `Return`.
 4. Send the call to the party's own actor `Actor(party, escrow)`, signed by that party, declaring every actor the README's table lists for it (README, Calling it).
-5. Read the record again to learn the outcome. A refused public call is still included and charged, so inclusion alone proves nothing. Done when the record shows the state and counters you expected.
+5. Read the record again to learn the outcome. The wallet runs a call before sending it and reports a refusal's code, but a call sent anyway is included and charged, so inclusion alone proves nothing. Done when the record shows the state and counters you expected.
+
+The repo's CLI (README, CLI) does all of this over the LEZ wallet, and is the quickest reference for a working call.
 
 Rules every call keeps:
 
-- The side being paid pulls its own payout, and it always goes to the record's `pay_to` or `refund_to`. To pay a public account the chain has never seen, add that account's public key as admission evidence.
+- The side being paid pulls its own payout, and it always goes to the record's `pay_to` or `refund_to`. To pay a public account the chain has never seen, add that account's public key as admission evidence; the LEZ wallet adds it for the accounts it holds.
+- Give each account one identity per transaction: the LEZ wallet refuses one named both signing and not, so a signer paid to itself keeps its signer's identity on its balance too.
+- Pay a private call's fee from a funded private account the wallet owns: private transactions pay in the proof, about 5M lepta each on a `v0.4.0-rc3` devnet.
 - Name every party, payee and controller by its canonical account id, never a blinded alias: LEZ resolves an alias before delivery, so a job that recorded one never matches its party.
 - Pull to a private payout address only from a private call (README, Private accounts). A public pull lands the money in a public account nobody can sign for.
 - Deadlines are milliseconds since the Unix epoch, checked against the block's timestamp: `Open` and `Deliver` land before it, a deadline `Refund` at or after it.
@@ -40,4 +44,8 @@ Start from [examples/arbiter](../../examples/arbiter/README.md): what it does, w
 
 ## Test against the escrow
 
-Until a 0.4 chain is up to test on, run the real guests through LEZ's own state machine, as `integration/tests/flows.rs` does: build the escrow with `make build`, seed a `V03State` from the `lee` crate (feature `test-utils`) with both programs at fixed ids, and send signed transactions that declare their actors and carry admission evidence for fresh payees. Give every test fresh `job_ref`s, and read records and balances back from the state.
+1. Build the escrow with `make build`, and add its binary to your `logos-devnet.toml` (README, On your own devnet). logos-devnet 0.10 and later run LEZ `v0.4.0-rc3`.
+2. Run `logos-devnet up`, then your tests under `logos-devnet exec -- <command>`, which exports `LOGOS_PROGRAM_ESCROW` and the chain's other settings.
+3. Give every run fresh `job_ref`s. A devnet keeps its state between runs, so run `logos-devnet reset` before a test that recreates the same private accounts.
+
+For tests without a chain, run the real guests through LEZ's own state machine, as `integration/tests/flows.rs` does: seed a `V03State` from the `lee` crate (feature `test-utils`) with the programs at fixed ids, and send signed transactions that declare their actors and carry admission evidence for fresh payees.
