@@ -424,8 +424,9 @@ fn at_job(
         },
         (action, _, _) => action,
     };
-    let event = event(job, &action);
+    let released_before = pre.as_ref().map_or(0, |record| record.released);
     let next = rules::step(pre, origin, action.clone())?;
+    let event = event(job, &action, next.released - released_before);
     let response =
         Response::set_state(borsh::to_vec(&next).expect("a job record serializes")).event(event);
     let payout = match action {
@@ -444,8 +445,8 @@ fn at_job(
     })
 }
 
-/// The event for `action` on `job`, once the rules allow it.
-fn event(job: AccountId, action: &Action) -> lee_core::program::ProgramEvent {
+/// The event for `action` on `job`, which the rules applied, releasing `released` with it.
+fn event(job: AccountId, action: &Action, released: Balance) -> lee_core::program::ProgramEvent {
     match action {
         Action::Open(record) => events::emit(
             "Opened",
@@ -463,6 +464,7 @@ fn event(job: AccountId, action: &Action) -> lee_core::program::ProgramEvent {
             &events::Delivered {
                 job,
                 result: *result,
+                released,
             },
         ),
         Action::Release { amount } => events::emit(

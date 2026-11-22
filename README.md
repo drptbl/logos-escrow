@@ -125,7 +125,7 @@ Every change to a job emits one event from the job's actor, a LEZ `ProgramEvent`
 | Event | Selector | Data |
 | --- | --- | --- |
 | `Opened` | `bd302df617c1685f` | `job`, `buyer`, `provider`, `amount: u128`, `deadline: u64`, `controller: Option<Actor>` |
-| `Delivered` | `a0cf04b66d2e0687` | `job`, `result: [u8; 32]` |
+| `Delivered` | `a0cf04b66d2e0687` | `job`, `result: [u8; 32]`, `released: u128`: everything left on a job without a controller, 0 on a controlled one |
 | `Released` | `95d8eff8ea992b74` | `job`, `amount: u128` |
 | `Claimed` | `5273036ec2490250` | `job`, `to`, `amount: u128` |
 | `Returned` | `a5eff4ddf518f44f` | `job` |

@@ -40,11 +40,13 @@ pub struct Opened {
     pub controller: Option<Actor>,
 }
 
-/// The provider recorded its result.
+/// The provider recorded its result. On a job without a controller that releases everything
+/// left, `released`; on a controlled job it releases nothing.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Delivered {
     pub job: AccountId,
     pub result: Hash32,
+    pub released: Balance,
 }
 
 /// The buyer or the controller let the provider claim `amount` more.

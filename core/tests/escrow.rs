@@ -882,14 +882,12 @@ fn nobody_releases_a_returned_job() {
     );
 }
 
-/// The event a response emitted, with its data decoded.
+/// The one event a response emitted, with its data decoded.
 fn event<T: borsh::BorshDeserialize>(response: &Response, name: &str) -> T {
-    let selector = events::selector(name);
-    let found = response
-        .events
-        .iter()
-        .find(|event| event.selector == selector)
-        .unwrap_or_else(|| panic!("no {name} event"));
+    let [found] = response.events.as_slice() else {
+        panic!("one event, got {}", response.events.len());
+    };
+    assert_eq!(found.selector, events::selector(name), "{name}");
     borsh::from_slice(&found.data).expect("event data decodes")
 }
 
@@ -908,6 +906,20 @@ fn event_selectors_are_stable() {
     ] {
         assert_eq!(hex(&events::selector(name)), selector, "{name}");
     }
+}
+
+#[test]
+fn a_delivery_without_a_controller_reports_what_it_released() {
+    let after_release = bytes(&call(signed(BUYER), &release_of(200), &opened()).expect("release"));
+    let delivered = call(signed(PROVIDER), &deliver(), &after_release).expect("deliver");
+    assert_eq!(
+        event::<events::Delivered>(&delivered, "Delivered"),
+        events::Delivered {
+            job: job(),
+            result: RESULT,
+            released: AMOUNT - 200,
+        }
+    );
 }
 
 #[test]
@@ -930,6 +942,7 @@ fn every_change_to_a_job_emits_its_event() {
         events::Delivered {
             job: job(),
             result: RESULT,
+            released: 0,
         }
     );
     let released = decide(
