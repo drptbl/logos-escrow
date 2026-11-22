@@ -587,11 +587,14 @@ fn only_the_escrow_itself_steps_a_job() {
     );
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Literals computed independently (Python `hashlib` and the borsh spec), so a caller that
 /// reimplements the derivation and the encoding can check itself against these.
 #[test]
 fn the_job_account_and_instruction_layout_are_stable() {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     assert_eq!(
         hex(job_seed(&BUYER, &JOB_REF).as_bytes()),
         "82f93aaaff0ed39ce06c69791bd64f06a3c4e8d97e1e44f2857a71bfbca0a504"
@@ -666,8 +669,7 @@ fn a_direct_open_may_name_any_controller() {
 /// Literals from the borsh spec, for callers that decode a job record or encode `Open` with a
 /// controller themselves.
 #[test]
-fn the_job_record_and_controlled_open_layout_are_stable() {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+fn the_job_record_controlled_open_and_decide_layouts_are_stable() {
     assert_eq!(
         hex(&opened_controlled()),
         concat!(
@@ -895,7 +897,6 @@ fn event<T: borsh::BorshDeserialize>(response: &Response, name: &str) -> T {
 /// LEZ's convention for event selectors.
 #[test]
 fn event_selectors_are_stable() {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     for (name, selector) in [
         ("Opened", "bd302df617c1685f"),
         ("Delivered", "a0cf04b66d2e0687"),
@@ -920,6 +921,30 @@ fn a_delivery_without_a_controller_reports_what_it_released() {
             released: AMOUNT - 200,
         }
     );
+}
+
+#[test]
+fn a_decision_needs_an_open_job() {
+    for decision in [Decision::Release { amount: 1 }, Decision::Return] {
+        assert_eq!(
+            decide(Some(controller()), decision, &[]).map(drop),
+            Err(EscrowError::NoJob),
+            "{decision:?}"
+        );
+        let refunded = bytes(
+            &call(
+                signed(BUYER),
+                &refund_of(AMOUNT, DEADLINE),
+                &opened_controlled(),
+            )
+            .expect("refund"),
+        );
+        assert_eq!(
+            decide(Some(controller()), decision, &refunded).map(drop),
+            Err(EscrowError::WrongState),
+            "{decision:?}"
+        );
+    }
 }
 
 #[test]
