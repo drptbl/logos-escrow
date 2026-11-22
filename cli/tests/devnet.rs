@@ -16,7 +16,7 @@ use std::{
 };
 
 use lee_core::account::{AccountId, Balance};
-use logos_escrow_core::Instruction;
+use logos_escrow_core::{Decision, Instruction};
 use wallet::{
     AccountIdentity, WalletCore,
     program_facades::{CreditDelivery, native_token_transfer::NativeTokenTransfer},
@@ -142,18 +142,28 @@ impl Devnet {
             .unwrap_or_else(|| panic!("no job state in:\n{text}"))
     }
 
-    /// Has the controller send `instruction` to `party`'s escrow actor; the payer signs and pays,
-    /// so no party does.
-    async fn relay(&self, party: AccountId, job: AccountId, instruction: &Instruction) {
+    /// Has the controller decide on `job`, straight at the job's actor: the payer signs the
+    /// call to the controller, which decides from the payer's actor under it. No party takes part.
+    async fn decide(
+        &self,
+        job: AccountId,
+        buyer: AccountId,
+        job_ref: [u8; 32],
+        decision: Decision,
+    ) {
+        let instruction = Instruction::Decide {
+            buyer,
+            job_ref,
+            decision,
+        };
         let relay = (
             self.program,
-            party,
+            job,
             Vec::<[u8; 32]>::new(),
-            borsh::to_vec(instruction).expect("instruction serializes"),
+            borsh::to_vec(&instruction).expect("instruction serializes"),
         );
         let accounts = vec![
             AccountIdentity::Public(self.payer).select_program_actor_state(self.controller),
-            AccountIdentity::PublicNoSign(party).select_program_actor_state(self.program),
             AccountIdentity::PublicNoSign(job).select_program_actor_state(self.program),
         ];
         let wallet = self.wallet();
@@ -164,11 +174,11 @@ impl Devnet {
                 borsh::to_vec(&relay).expect("relay serializes"),
             )
             .await
-            .expect("send the relay");
+            .expect("send the decision");
         wallet
             .poll_transaction(hash)
             .await
-            .expect("the relay lands");
+            .expect("the decision lands");
     }
 
     async fn public_balance(&self, id: AccountId) -> Balance {
@@ -226,7 +236,8 @@ async fn every_flow_settles_on_a_devnet() {
             secs,
         ];
         if let Some(controller) = controller {
-            args.extend(["--controller", controller]);
+            // The controller decides from the payer's actor under it.
+            args.extend(["--controller", controller, "--controller-account", &payer]);
         }
         args.into_iter().map(str::to_owned).collect()
     };
@@ -317,25 +328,16 @@ async fn every_flow_settles_on_a_devnet() {
     let job_account =
         logos_escrow_core::job_account_id(&devnet.program, &devnet.buyer, &job_ref_bytes);
     devnet
-        .relay(
-            devnet.buyer,
+        .decide(
             job_account,
-            &Instruction::Release {
-                job_ref: job_ref_bytes,
-                amount: AMOUNT / 4,
-            },
+            devnet.buyer,
+            job_ref_bytes,
+            Decision::Release { amount: AMOUNT / 4 },
         )
         .await;
     assert_eq!(call(on(&job, "claim", &[])), "Open");
     devnet
-        .relay(
-            devnet.provider,
-            job_account,
-            &Instruction::Return {
-                buyer: devnet.buyer,
-                job_ref: job_ref_bytes,
-            },
-        )
+        .decide(job_account, devnet.buyer, job_ref_bytes, Decision::Return)
         .await;
     assert_eq!(call(on(&job, "refund", &[])), "Refunded");
     assert_eq!(
@@ -354,7 +356,7 @@ async fn every_flow_settles_on_a_devnet() {
     // Private transactions pay their fees in LEZ 0.4, from an owned private account: this one.
     let (private_fees, _) = wallet.create_new_account_private(None);
     wallet.store_persistent_data().expect("save the wallet");
-    for (account, amount) in [(private_buyer, 10 * AMOUNT), (private_fees, 100 * AMOUNT)] {
+    for (account, amount) in [(private_buyer, 20 * AMOUNT), (private_fees, 100 * AMOUNT)] {
         let (hash, _) = NativeTokenTransfer(&wallet)
             .transfer(
                 AccountIdentity::Public(devnet.payer),
@@ -375,7 +377,9 @@ async fn every_flow_settles_on_a_devnet() {
     let (pbuyer, pprovider) = (private_buyer.to_string(), private_provider.to_string());
     let fees = private_fees.to_string();
 
-    for flow in ["claim", "return", "release", "pre-funded"] {
+    // "decided": a job between private parties, released by its controller in a public call that
+    // names no party, so neither has to be online for it.
+    for flow in ["claim", "return", "release", "pre-funded", "decided"] {
         let job = job_ref();
         let pay_to = devnet.cli(&["payout-address"]).trim().to_owned();
         if flow == "pre-funded" {
@@ -399,7 +403,8 @@ async fn every_flow_settles_on_a_devnet() {
             wallet.store_persistent_data().expect("save the wallet");
         }
         let refund_to = devnet.cli(&["payout-address"]).trim().to_owned();
-        let open = [
+        let controller = devnet.controller.to_string();
+        let mut open = vec![
             "--payer",
             &fees,
             "open",
@@ -418,6 +423,9 @@ async fn every_flow_settles_on_a_devnet() {
             "--in-secs",
             "600",
         ];
+        if flow == "decided" {
+            open.extend(["--controller", &controller, "--controller-account", &payer]);
+        }
         assert_eq!(devnet.call(&open), "Open", "{flow}");
         let on = |command: &str, extra: &[&str]| -> Vec<String> {
             [
@@ -450,10 +458,25 @@ async fn every_flow_settles_on_a_devnet() {
                 assert_eq!(call(on("claim", &[])), "Open");
                 assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
             }
-            _ => {
+            "pre-funded" => {
                 assert_eq!(call(on("deliver", &["--result", &job])), "Delivered");
                 assert_eq!(call(on("claim", &[])), "Delivered");
                 assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT + 1);
+            }
+            _ => {
+                let job_ref = <[u8; 32]>::try_from(hex::decode(&job).expect("hex")).expect("32");
+                let job_account =
+                    logos_escrow_core::job_account_id(&devnet.program, &private_buyer, &job_ref);
+                devnet
+                    .decide(
+                        job_account,
+                        private_buyer,
+                        job_ref,
+                        Decision::Release { amount: AMOUNT },
+                    )
+                    .await;
+                assert_eq!(call(on("claim", &[])), "Open");
+                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
             }
         }
     }

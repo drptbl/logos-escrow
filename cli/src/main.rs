@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use lee::{privacy_preserving_transaction::circuit::ProgramCatalog, program::Program};
-use lee_core::account::{AccountId, Balance};
+use lee_core::account::{AccountId, Actor, Balance};
 use logos_escrow_core::{Hash32, Instruction, Job, JobState, job_account_id};
 use wallet::{AccountIdentity, AccountMention, AsyncDelivery, WalletCore, WalletSequencerClient};
 
@@ -95,10 +95,14 @@ enum Command {
         deadline_ms: Option<u64>,
         #[arg(long)]
         in_secs: Option<u64>,
-        /// A program that may release and return the job besides the parties. On a controlled
-        /// job, delivering releases nothing; the controller decides.
-        #[arg(long)]
+        /// The program whose actor may release and return the job besides the parties, by
+        /// deciding at the job. On a controlled job, delivering releases nothing; the controller
+        /// decides.
+        #[arg(long, requires = "controller_account")]
         controller: Option<AccountId>,
+        /// The account of that actor: the one the controller program decides from.
+        #[arg(long, requires = "controller")]
+        controller_account: Option<AccountId>,
     },
     /// Provider: record the result hash before the deadline.
     Deliver {
@@ -159,7 +163,11 @@ async fn main() -> Result<()> {
             deadline_ms,
             in_secs,
             controller,
+            controller_account,
         } => {
+            let controller = controller
+                .zip(controller_account)
+                .map(|(program, account)| Actor::new(account, program));
             let deadline = match (deadline_ms, in_secs) {
                 (Some(deadline), _) => deadline,
                 (None, Some(secs)) => secs
