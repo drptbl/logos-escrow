@@ -27,8 +27,8 @@ struct Args {
     /// The escrow program's header account id (base58). logos-devnet exports it.
     #[arg(long, env = "LOGOS_PROGRAM_ESCROW", global = true)]
     program: Option<AccountId>,
-    /// Send the call even when the job record says it will be refused, which a public call
-    /// still pays for.
+    /// Send the call even when the job record says it will be refused. The wallet runs it
+    /// first, and still won't send one the program refuses.
     #[arg(long, global = true)]
     force: bool,
     /// A wallet account that pays the transaction's fee; by default the signer pays. A private
@@ -63,7 +63,7 @@ struct PayoutArgs {
     job: JobArgs,
     /// Pay a public account this wallet holds no key for, which has to exist on chain already.
     /// Without it, the CLI refuses to send a payout it can't place, because a private address
-    /// paid publicly is burned.
+    /// paid publicly would land in a public account nobody can sign for.
     #[arg(long)]
     public_payee: bool,
 }
@@ -270,8 +270,8 @@ enum Call {
 }
 
 /// Why the escrow, or LEZ's deadline window, would refuse `call` on `record` at `now` (in
-/// milliseconds). A refused public call is still included and charged, so the CLI checks before
-/// it sends. The clock is this machine's, which can differ a little from the block's.
+/// milliseconds), so the CLI can say why before it sends. The clock is this machine's, which can
+/// differ a little from the block's.
 fn preflight(call: &Call, record: &Job, now: u64) -> Result<(), String> {
     let open = record.state == JobState::Open;
     match call {
@@ -418,9 +418,9 @@ impl<C: WalletSequencerClient> Escrow<C> {
         let mut accounts = vec![self.party(signer), self.job(&payout.job)];
         accounts.push(AccountIdentity::PublicNoSign(self.job_account(&payout.job)).balance());
         // The wallet names one account by one identity in a transaction, so a signer paid to
-        // itself keeps its signer's.
-        accounts.push(if payee == signer {
-            self.signer(signer).balance()
+        // itself keeps its signer's, and a fee payer paid keeps its signing one.
+        accounts.push(if payee == signer || Some(payee) == self.payer {
+            self.signer(payee).balance()
         } else {
             self.payee(payee, payout)?
         });
@@ -524,7 +524,7 @@ impl<C: WalletSequencerClient> Escrow<C> {
             self.wallet.sync_to_latest_block().await?;
             self.wallet.store_persistent_data()?;
         }
-        // A public call that was refused is still included and charged, so read the record back.
+        // Inclusion alone doesn't say what the call did, so read the record back.
         self.show(job).await
     }
 }
