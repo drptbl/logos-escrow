@@ -2,9 +2,9 @@
 //!
 //! A party sends each instruction to its own actor under the escrow, declaring the job's actor
 //! and, for a call that moves lepta, both ends' native balances. A call goes public through
-//! `WalletCore::send_pub_tx_paid_by`, or private through `WalletCore::send_tx` when the signer or
-//! the payee is one of the wallet's private accounts. The job record is read back from the job
-//! account's escrow state.
+//! `WalletCore::send_pub_tx_paid_by`, or private through `WalletCore::send_tx_with_pre_check`,
+//! the variant that takes a fee payer, when the signer or the payee is one of the wallet's private
+//! accounts. The job record is read back from the job account's escrow state.
 
 use std::{
     path::PathBuf,
@@ -17,6 +17,9 @@ use lee::{privacy_preserving_transaction::circuit::ProgramCatalog, program::Prog
 use lee_core::account::{AccountId, Balance};
 use logos_escrow_core::{Hash32, Instruction, Job, JobState, job_account_id};
 use wallet::{AccountIdentity, AccountMention, AsyncDelivery, WalletCore, WalletSequencerClient};
+
+/// Where the instruction goes: the first account given, the party's own actor under the escrow.
+const PARTY_ACTOR: usize = 0;
 
 #[derive(Parser)]
 #[command(about = "Drive the logos-escrow program from a LEZ v0.4 wallet")]
@@ -175,7 +178,7 @@ async fn main() -> Result<()> {
                 controller,
             };
             let job_account = escrow.job_account(&job);
-            let exists = escrow.record(&job).await.is_ok();
+            let exists = escrow.job_record(&job).await?.is_some();
             check(
                 force,
                 open_preflight(&instruction, job.buyer, job_account, exists, now_ms()?),
@@ -441,7 +444,8 @@ impl<C: WalletSequencerClient> Escrow<C> {
         }
     }
 
-    async fn record(&self, job: &JobArgs) -> Result<Job> {
+    /// The job's record, or `None` when its account holds none.
+    async fn job_record(&self, job: &JobArgs) -> Result<Option<Job>> {
         let account = self
             .wallet
             .get_account_public(self.job_account(job))
@@ -449,9 +453,15 @@ impl<C: WalletSequencerClient> Escrow<C> {
             .unwrap_or_default();
         let state = account.data.actor_state(self.program);
         if state.is_empty() {
-            bail!("no job at {}", self.job_account(job));
+            return Ok(None);
         }
-        Ok(borsh::from_slice(state)?)
+        Ok(Some(borsh::from_slice(state)?))
+    }
+
+    async fn record(&self, job: &JobArgs) -> Result<Job> {
+        self.job_record(job)
+            .await?
+            .with_context(|| format!("no job at {}", self.job_account(job)))
     }
 
     async fn show(&self, job: &JobArgs) -> Result<()> {
@@ -486,7 +496,7 @@ impl<C: WalletSequencerClient> Escrow<C> {
                 .wallet
                 .send_tx_with_pre_check(
                     accounts,
-                    0,
+                    PARTY_ACTOR,
                     data,
                     &programs,
                     None,
@@ -499,7 +509,7 @@ impl<C: WalletSequencerClient> Escrow<C> {
             hash
         } else {
             self.wallet
-                .send_pub_tx_paid_by(accounts, 0, data, self.payer)
+                .send_pub_tx_paid_by(accounts, PARTY_ACTOR, data, self.payer)
                 .await
                 .map_err(|error| anyhow::anyhow!("send failed: {error:?}"))?
         };
