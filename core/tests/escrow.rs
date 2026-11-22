@@ -7,7 +7,7 @@ use lee_core::{
     program::{ReceiveInput, Response, SyncMessage},
 };
 use logos_escrow_core::{
-    EscrowError, Instruction, Job, JobState, handle, job_account_id, job_seed,
+    Decision, EscrowError, Instruction, Job, JobState, handle, job_account_id, job_seed,
 };
 
 const PROGRAM: AccountId = AccountId::new([7; 32]);
@@ -23,6 +23,13 @@ const DEADLINE: u64 = 1_800_000_000_000;
 const RESULT: [u8; 32] = [4; 32];
 /// The program a controlled job names, and one it doesn't.
 const CONTROLLER: AccountId = AccountId::new([8; 32]);
+/// The account whose actor under `CONTROLLER` the controlled job names.
+const CONTROLLER_ACCOUNT: AccountId = AccountId::new([11; 32]);
+
+/// The one actor a controlled job names as its controller.
+const fn controller() -> Actor {
+    Actor::new(CONTROLLER_ACCOUNT, CONTROLLER)
+}
 const OTHER_PROGRAM: AccountId = AccountId::new([10; 32]);
 
 fn job() -> AccountId {
@@ -113,7 +120,7 @@ fn payout(to: AccountId, amount: u128) -> SyncMessage {
     custody_transfer(job(), job_seed(&BUYER, &JOB_REF), to, amount)
 }
 
-fn open_controlled_by(controller: Option<AccountId>) -> Instruction {
+fn open_controlled_by(controller: Option<Actor>) -> Instruction {
     Instruction::Open {
         job_ref: JOB_REF,
         provider: PROVIDER,
@@ -136,7 +143,7 @@ fn opened() -> Vec<u8> {
 
 /// The job record right after the buyer opened it naming `CONTROLLER`.
 fn opened_controlled() -> Vec<u8> {
-    bytes(&call(signed(BUYER), &open_controlled_by(Some(CONTROLLER)), &[]).expect("open"))
+    bytes(&call(signed(BUYER), &open_controlled_by(Some(controller())), &[]).expect("open"))
 }
 
 fn deliver() -> Instruction {
@@ -634,10 +641,26 @@ fn the_job_account_and_instruction_layout_are_stable() {
     );
 }
 
+/// A decision sent straight to the job's actor by `sender`, or by the transaction itself.
+fn decide(sender: Option<Actor>, decision: Decision, pre: &[u8]) -> Result<Response, EscrowError> {
+    handle(&ReceiveInput {
+        receiver: Actor::new(job(), PROGRAM),
+        from: sender,
+        is_authorized: false,
+        pre_state: ActorState::from(pre.to_vec()),
+        message: borsh::to_vec(&Instruction::Decide {
+            buyer: BUYER,
+            job_ref: JOB_REF,
+            decision,
+        })
+        .expect("serializes"),
+    })
+}
+
 #[test]
 fn a_direct_open_may_name_any_controller() {
     let job: Job = borsh::from_slice(&opened_controlled()).expect("a record");
-    assert_eq!(job.controller, Some(CONTROLLER));
+    assert_eq!(job.controller, Some(controller()));
 }
 
 /// Literals from the borsh spec, for callers that decode a job record or encode `Open` with a
@@ -659,23 +682,43 @@ fn the_job_record_and_controlled_open_layout_are_stable() {
             "00",
             "00",
             "01",
+            "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
             "0808080808080808080808080808080808080808080808080808080808080808"
         )
     );
     assert!(
-        hex(&borsh::to_vec(&open_controlled_by(Some(CONTROLLER))).expect("serializes")).ends_with(
-            "00505c18a3010000010808080808080808080808080808080808080808080808080808080808080808"
+        hex(&borsh::to_vec(&open_controlled_by(Some(controller()))).expect("serializes"))
+            .ends_with(concat!(
+                "00505c18a3010000",
+                "01",
+                "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                "0808080808080808080808080808080808080808080808080808080808080808"
+            ))
+    );
+    let decide = Instruction::Decide {
+        buyer: BUYER,
+        job_ref: JOB_REF,
+        decision: Decision::Release { amount: AMOUNT },
+    };
+    assert_eq!(
+        hex(&borsh::to_vec(&decide).expect("serializes")),
+        concat!(
+            "06",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "0909090909090909090909090909090909090909090909090909090909090909",
+            "00",
+            "f4010000000000000000000000000000"
         )
     );
 }
 
 #[test]
-fn a_program_may_only_open_a_job_it_controls() {
+fn a_program_may_only_open_a_job_one_of_its_actors_controls() {
     // The buyer's signature carries into the controller's call to the escrow.
     let itself = from(CONTROLLER, signed(BUYER));
-    let applied = call(itself, &open_controlled_by(Some(CONTROLLER)), &[]).expect("applies");
-    assert_eq!(record(&applied).controller, Some(CONTROLLER));
-    for named in [None, Some(OTHER_PROGRAM)] {
+    let applied = call(itself, &open_controlled_by(Some(controller())), &[]).expect("applies");
+    assert_eq!(record(&applied).controller, Some(controller()));
+    for named in [None, Some(Actor::new(CONTROLLER_ACCOUNT, OTHER_PROGRAM))] {
         assert_eq!(
             call(itself, &open_controlled_by(named), &[]).map(drop),
             Err(EscrowError::NotDirect),
@@ -685,21 +728,73 @@ fn a_program_may_only_open_a_job_it_controls() {
 }
 
 #[test]
-fn the_controller_releases_and_returns_without_the_parties() {
-    let release = call(
-        from(CONTROLLER, unsigned(BUYER)),
-        &release_of(200),
+fn the_controller_releases_and_returns_by_deciding_at_the_job() {
+    let release = decide(
+        Some(controller()),
+        Decision::Release { amount: 200 },
         &opened_controlled(),
     )
     .expect("the controller releases");
+    assert!(release.sync_messages.is_empty());
     assert_eq!(record(&release).released, 200);
-    let give_back = call(
-        from(CONTROLLER, unsigned(PROVIDER)),
-        &give_back(),
-        &opened_controlled(),
-    )
-    .expect("the controller returns");
+    let give_back = decide(Some(controller()), Decision::Return, &opened_controlled())
+        .expect("the controller returns");
     assert_eq!(record(&give_back).state, JobState::Returned);
+}
+
+#[test]
+fn only_the_jobs_exact_controller_decides() {
+    let release = Decision::Release { amount: 200 };
+    let senders = [
+        // The transaction itself, on a controlled job and on one with no controller.
+        (None, opened_controlled()),
+        (None, opened()),
+        // Another actor of the controller's own program.
+        (Some(Actor::new(STRANGER, CONTROLLER)), opened_controlled()),
+        // The controller's account under another program.
+        (
+            Some(Actor::new(CONTROLLER_ACCOUNT, OTHER_PROGRAM)),
+            opened_controlled(),
+        ),
+        // The controller, on a job that names none.
+        (Some(controller()), opened()),
+    ];
+    for (sender, pre) in senders {
+        assert_eq!(
+            decide(sender, release, &pre).map(drop),
+            Err(EscrowError::NotDirect),
+            "{sender:?}"
+        );
+    }
+}
+
+#[test]
+fn a_decision_names_its_job() {
+    // At another job's actor, or at a party's.
+    let elsewhere = ReceiveInput {
+        receiver: Actor::new(job_account_id(&PROGRAM, &PROVIDER, &JOB_REF), PROGRAM),
+        from: Some(controller()),
+        is_authorized: false,
+        pre_state: ActorState::from(opened_controlled()),
+        message: borsh::to_vec(&Instruction::Decide {
+            buyer: BUYER,
+            job_ref: JOB_REF,
+            decision: Decision::Return,
+        })
+        .expect("serializes"),
+    };
+    assert_eq!(
+        handle(&elsewhere).map(drop),
+        Err(EscrowError::WrongJobAccount)
+    );
+    let at_a_party = ReceiveInput {
+        receiver: Actor::new(BUYER, PROGRAM),
+        ..elsewhere
+    };
+    assert_eq!(
+        handle(&at_a_party).map(drop),
+        Err(EscrowError::WrongJobAccount)
+    );
 }
 
 #[test]
@@ -729,9 +824,9 @@ fn a_program_cannot_act_on_a_job_it_does_not_control() {
 /// The controlled job after the controller released all of it.
 fn released_controlled() -> Vec<u8> {
     bytes(
-        &call(
-            from(CONTROLLER, unsigned(BUYER)),
-            &release(),
+        &decide(
+            Some(controller()),
+            Decision::Release { amount: AMOUNT },
             &opened_controlled(),
         )
         .expect("release"),
@@ -739,45 +834,26 @@ fn released_controlled() -> Vec<u8> {
 }
 
 #[test]
-fn the_controller_cannot_deliver_or_pull_payouts_for_the_parties() {
-    // A payout pulled in a public call to a private address would be lost, so only the side
-    // being paid pulls, even when the controller calls.
-    assert_eq!(
-        call(
-            from(CONTROLLER, unsigned(PROVIDER)),
-            &deliver(),
-            &opened_controlled()
-        )
-        .map(drop),
-        Err(EscrowError::Unauthorized)
-    );
-    assert_eq!(
-        call(
-            from(CONTROLLER, unsigned(PROVIDER)),
-            &claim(),
-            &released_controlled()
-        )
-        .map(drop),
-        Err(EscrowError::Unauthorized)
-    );
-    let returned = bytes(
-        &call(
-            from(CONTROLLER, unsigned(PROVIDER)),
-            &give_back(),
-            &opened_controlled(),
-        )
-        .expect("return"),
-    );
-    assert_eq!(
-        call(
-            from(CONTROLLER, unsigned(BUYER)),
-            &refund_of(AMOUNT, 0),
-            &returned
-        )
-        .map(drop),
-        Err(EscrowError::Unauthorized)
-    );
-    // A party the controller authorizes, such as its own PDA, still pulls through it.
+fn a_party_call_always_needs_the_party() {
+    // Through a party's actor even the controller's program needs the party: its decisions go
+    // straight to the job instead. And only the side being paid pulls, so a payout pulled in a
+    // public call to a private address can't be lost.
+    let calls = [
+        (unsigned(BUYER), release_of(200), opened_controlled()),
+        (unsigned(PROVIDER), give_back(), opened_controlled()),
+        (unsigned(PROVIDER), deliver(), opened_controlled()),
+        (unsigned(PROVIDER), claim(), released_controlled()),
+    ];
+    for (by, instruction, pre) in calls {
+        assert_eq!(
+            call(from(CONTROLLER, by), &instruction, &pre).map(drop),
+            Err(EscrowError::Unauthorized),
+            "{instruction:?}"
+        );
+    }
+    // A party the controller's program authorizes, such as its own PDA, still acts through it.
+    let returned =
+        bytes(&decide(Some(controller()), Decision::Return, &opened_controlled()).expect("return"));
     let refunded = call(
         from(CONTROLLER, signed(BUYER)),
         &refund_of(AMOUNT, 0),
@@ -789,20 +865,21 @@ fn the_controller_cannot_deliver_or_pull_payouts_for_the_parties() {
 
 #[test]
 fn nobody_releases_a_returned_job() {
-    let returned = bytes(
-        &call(
-            from(CONTROLLER, unsigned(PROVIDER)),
-            &give_back(),
-            &opened_controlled(),
-        )
-        .expect("return"),
+    let returned =
+        bytes(&decide(Some(controller()), Decision::Return, &opened_controlled()).expect("return"));
+    assert_eq!(
+        call(signed(BUYER), &release_of(1), &returned).map(drop),
+        Err(EscrowError::WrongState)
     );
-    for by in [signed(BUYER), from(CONTROLLER, unsigned(BUYER))] {
-        assert_eq!(
-            call(by, &release_of(1), &returned).map(drop),
-            Err(EscrowError::WrongState)
-        );
-    }
+    assert_eq!(
+        decide(
+            Some(controller()),
+            Decision::Release { amount: 1 },
+            &returned
+        )
+        .map(drop),
+        Err(EscrowError::WrongState)
+    );
 }
 
 #[test]

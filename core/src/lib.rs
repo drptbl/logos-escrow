@@ -83,7 +83,7 @@ pub enum Instruction {
         refund_to: AccountId,
         amount: Balance,
         deadline: Timestamp,
-        controller: Option<AccountId>,
+        controller: Option<Actor>,
     },
     /// Records the provider's result hash, once, before the job's `deadline`. On a job without
     /// a controller it also releases everything left. To `Actor(provider, escrow)`.
@@ -101,8 +101,7 @@ pub enum Instruction {
         amount: Balance,
     },
     /// Lets the provider claim `amount` more of an open job's deposit, up to all of it that is
-    /// left. Moves no money. The controller may call it without the buyer. To
-    /// `Actor(buyer, escrow)`.
+    /// left. Moves no money. To `Actor(buyer, escrow)`.
     Release { job_ref: Hash32, amount: Balance },
     /// Pays the part of the deposit never released, which must be `amount`, back to the job's
     /// `refund_to`: from an open job's `deadline` on, or from a returned job at any time, when
@@ -113,9 +112,25 @@ pub enum Instruction {
         deadline: Timestamp,
     },
     /// The provider gives up an open job, so the buyer can refund what was never released at
-    /// once. Moves no money. The controller may call it without the provider. To
-    /// `Actor(provider, escrow)`.
+    /// once. Moves no money. To `Actor(provider, escrow)`.
     Return { buyer: AccountId, job_ref: Hash32 },
+    /// The controller's decision on the job of `buyer` and `job_ref`, sent straight to the job's
+    /// actor `Actor(job, escrow)` from the exact actor the job names as its controller. Needs no
+    /// party, so a private party being offline can't block it.
+    Decide {
+        buyer: AccountId,
+        job_ref: Hash32,
+        decision: Decision,
+    },
+}
+
+/// What a controller decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum Decision {
+    /// Lets the provider claim `amount` more of the deposit, up to all of it that is left.
+    Release { amount: Balance },
+    /// Gives what was never released back to the buyer, who can refund it at once.
+    Return,
 }
 
 /// Why the escrow program refused a call. The guest exits with [`EscrowError::code`].
@@ -178,27 +193,53 @@ struct Step {
     action: Action,
 }
 
-/// Handles one message to one of the escrow's actors: a party's instruction, or a step the
-/// escrow passed on to a job.
+/// Handles one message to one of the escrow's actors: a party's instruction, a controller's
+/// decision at a job, or a step the escrow passed on to a job.
 pub fn handle(input: &ReceiveInput) -> Result<Response, EscrowError> {
     if input.from_own_program() {
-        let step =
+        let step: Step =
             borsh::from_slice(&input.message).map_err(|_| EscrowError::InvalidInstruction)?;
-        on_job(input, step)
-    } else {
-        let instruction =
-            borsh::from_slice(&input.message).map_err(|_| EscrowError::InvalidInstruction)?;
-        on_party(input, instruction)
+        return at_job(input, step.buyer, step.job_ref, step.origin, step.action);
     }
+    match borsh::from_slice(&input.message).map_err(|_| EscrowError::InvalidInstruction)? {
+        Instruction::Decide {
+            buyer,
+            job_ref,
+            decision,
+        } => on_decide(input, buyer, job_ref, decision),
+        instruction => on_party(input, instruction),
+    }
+}
+
+/// A controller's decision, at the job's actor. Only the exact actor the job names gets past the
+/// rules; a decision the transaction sent itself has no sender and never does.
+fn on_decide(
+    input: &ReceiveInput,
+    buyer: AccountId,
+    job_ref: Hash32,
+    decision: Decision,
+) -> Result<Response, EscrowError> {
+    let origin = match input.from {
+        Some(sender) => Origin::Controller(sender),
+        None => return Err(EscrowError::NotDirect),
+    };
+    let action = match decision {
+        Decision::Release { amount } => Action::Release { amount },
+        // The provider's identity is the record's own: the job's actor fills it in.
+        Decision::Return => Action::Return {
+            provider: input.receiver.account_id,
+        },
+    };
+    at_job(input, buyer, job_ref, origin, action)
 }
 
 /// A party's instruction at its own actor: turns it into the step for the job.
 fn on_party(input: &ReceiveInput, instruction: Instruction) -> Result<Response, EscrowError> {
     let program = input.receiver.program_account_id;
     let party = input.receiver.account_id;
-    let origin = Origin {
+    let origin = Origin::Party {
         caller: input.from.map(|caller| caller.program_account_id),
-        party_authorized: input.is_authorized,
+        authorized: input.is_authorized,
     };
     // Claim and Refund pay the record's own addresses, which only the job's actor holds: it
     // replaces this with them.
@@ -298,6 +339,8 @@ fn on_party(input: &ReceiveInput, instruction: Instruction) -> Result<Response, 
                 (deadline..).into(),
                 None,
             ),
+            // `handle` takes decisions to the job's actor.
+            Instruction::Decide { .. } => unreachable!("a decision isn't a party's call"),
             Instruction::Return { buyer, job_ref } => (
                 buyer,
                 job_ref,
@@ -329,11 +372,17 @@ fn to_job(program: AccountId, step: Step) -> SyncMessage {
     SyncMessage::new(Actor::new(job, program), &step).with_pda_seeds([seed])
 }
 
-/// A step at the job's actor: applies the job rules to its record, and pays out what they allow.
-fn on_job(input: &ReceiveInput, step: Step) -> Result<Response, EscrowError> {
+/// At the job's actor: applies the job rules to its record, and pays out what they allow.
+fn at_job(
+    input: &ReceiveInput,
+    buyer: AccountId,
+    job_ref: Hash32,
+    origin: Origin,
+    action: Action,
+) -> Result<Response, EscrowError> {
     let program = input.receiver.program_account_id;
     let job = input.receiver.account_id;
-    if job != job_account_id(&program, &step.buyer, &step.job_ref) {
+    if job != job_account_id(&program, &buyer, &job_ref) {
         return Err(EscrowError::WrongJobAccount);
     }
     let pre: Option<Job> = if input.pre_state.is_empty() {
@@ -342,41 +391,46 @@ fn on_job(input: &ReceiveInput, step: Step) -> Result<Response, EscrowError> {
         // Only this program writes its job records, so one that does not decode cannot happen.
         Some(borsh::from_slice(&input.pre_state).map_err(|_| EscrowError::NoJob)?)
     };
-    let (action, payout) = match (step.action, &pre) {
+    // Payees, and a controller's provider, are the record's own.
+    let action = match (action, &pre, origin) {
         (
             Action::Claim {
                 provider, amount, ..
             },
             Some(record),
-        ) => (
-            Action::Claim {
-                provider,
-                payee: record.pay_to,
-                amount,
-            },
-            Some((record.pay_to, amount)),
-        ),
+            _,
+        ) => Action::Claim {
+            provider,
+            payee: record.pay_to,
+            amount,
+        },
         (
             Action::Refund {
                 amount, deadline, ..
             },
             Some(record),
-        ) => (
-            Action::Refund {
-                payee: record.refund_to,
-                amount,
-                deadline,
-            },
-            Some((record.refund_to, amount)),
-        ),
-        (action, _) => (action, None),
+            _,
+        ) => Action::Refund {
+            payee: record.refund_to,
+            amount,
+            deadline,
+        },
+        (Action::Return { .. }, Some(record), Origin::Controller(_)) => Action::Return {
+            provider: record.provider,
+        },
+        (action, _, _) => action,
     };
-    let next = rules::step(pre, step.origin, action)?;
+    let next = rules::step(pre, origin, action.clone())?;
     let response = Response::set_state(borsh::to_vec(&next).expect("a job record serializes"));
+    let payout = match action {
+        Action::Claim { amount, .. } => Some((next.pay_to, amount)),
+        Action::Refund { amount, .. } => Some((next.refund_to, amount)),
+        _ => None,
+    };
     Ok(match payout {
         Some((payee, amount)) => response.send(custody_transfer(
             job,
-            job_seed(&step.buyer, &step.job_ref),
+            job_seed(&buyer, &job_ref),
             payee,
             amount,
         )),

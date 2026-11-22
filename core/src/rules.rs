@@ -5,7 +5,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
     Timestamp,
-    account::{AccountId, Balance},
+    account::{AccountId, Actor, Balance},
 };
 
 use crate::{EscrowError, Hash32};
@@ -42,8 +42,9 @@ pub struct Job {
     pub deadline: Timestamp,
     pub state: JobState,
     pub result: Option<Hash32>,
-    /// The program that may act on this job besides its parties.
-    pub controller: Option<AccountId>,
+    /// The one actor, an account's state under a program, that may release and return this job
+    /// besides its parties.
+    pub controller: Option<Actor>,
 }
 
 impl Job {
@@ -62,15 +63,23 @@ impl Job {
 
 /// Who asked for an action.
 #[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]
-pub struct Origin {
-    /// The program that called the escrow, or `None` when the transaction called it directly.
-    pub caller: Option<AccountId>,
-    /// Whether the party the action names (the buyer or the provider) authorized it.
-    pub party_authorized: bool,
+pub enum Origin {
+    /// A party's call: the program that called the escrow, or `None` when the transaction called
+    /// it directly, and whether the party the action names authorized it.
+    Party {
+        caller: Option<AccountId>,
+        authorized: bool,
+    },
+    /// A decision sent straight to the job by this actor.
+    Controller(Actor),
 }
 
 /// One change to a job, with the values the caller quoted for the record to match.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one action lives for one call, so boxing the record would only add an allocation"
+)]
 pub enum Action {
     Open(Job),
     Deliver {
@@ -99,21 +108,33 @@ pub enum Action {
 /// Applies `action`, asked for by `origin`, to the job record `pre`, or to no record, and
 /// returns the next record.
 ///
-/// A program may only act on a job it controls. The controller may `Release` and `Return` on its
-/// own; every other action needs the party it names, so only the side being paid pulls a payout.
+/// Every party call needs the party it names, so only the side being paid pulls a payout. A
+/// program may only call for a job its controller belongs to, and may open a job only naming one
+/// of its own actors. The job's controller, and only that exact actor, may `Release` and `Return`
+/// on its own, by a decision sent straight to the job.
 pub fn step(pre: Option<Job>, origin: Origin, action: Action) -> Result<Job, EscrowError> {
     // The new job's controller for `Open`, so a program opens a job only for itself.
     let controller = match (&action, &pre) {
         (Action::Open(job), _) | (_, Some(job)) => job.controller,
         (_, None) => return Err(EscrowError::NoJob),
     };
-    if origin.caller.is_some() && origin.caller != controller {
-        return Err(EscrowError::NotDirect);
-    }
-    let controller_acts_alone =
-        origin.caller.is_some() && matches!(action, Action::Release { .. } | Action::Return { .. });
-    if !controller_acts_alone && !origin.party_authorized {
-        return Err(EscrowError::Unauthorized);
+    match origin {
+        Origin::Party { caller, authorized } => {
+            if caller.is_some() && caller != controller.map(|actor| actor.program_account_id) {
+                return Err(EscrowError::NotDirect);
+            }
+            if !authorized {
+                return Err(EscrowError::Unauthorized);
+            }
+        }
+        Origin::Controller(sender) => {
+            if controller != Some(sender) {
+                return Err(EscrowError::NotDirect);
+            }
+            if !matches!(action, Action::Release { .. } | Action::Return { .. }) {
+                return Err(EscrowError::Unauthorized);
+            }
+        }
     }
     if let Action::Open(job) = action {
         return match pre {
