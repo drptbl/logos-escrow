@@ -88,6 +88,12 @@ fn job() -> AccountId {
     job_account_id(&PROGRAM, &buyer().id, &JOB_REF)
 }
 
+/// The test controller decides from the actor its call reached: the operator's, when the
+/// operator signs the relay.
+fn controller() -> Actor {
+    Actor::new(operator().id, CONTROLLER)
+}
+
 fn escrow(account: AccountId) -> Actor {
     Actor::new(account, PROGRAM)
 }
@@ -201,7 +207,10 @@ impl Chain {
     ) -> Result<(), LeeError> {
         let root = Actor::new(signer.id, CONTROLLER);
         // The job is the buyer's; a treasury buying for itself has its own.
-        let mut actors = vec![root, escrow(party), escrow(job())];
+        let mut actors = vec![root, escrow(party)];
+        if party != job() {
+            actors.push(escrow(job()));
+        }
         if job_for(party) != job() && party != provider().id {
             actors.push(escrow(job_for(party)));
         }
@@ -236,7 +245,7 @@ impl Chain {
         self.open_controlled_by(None)
     }
 
-    fn open_controlled_by(&mut self, controller: Option<AccountId>) -> Result<(), LeeError> {
+    fn open_controlled_by(&mut self, controller: Option<Actor>) -> Result<(), LeeError> {
         self.call(
             &buyer(),
             &open_instruction(controller),
@@ -293,7 +302,7 @@ fn job_for(buyer: AccountId) -> AccountId {
     job_account_id(&PROGRAM, &buyer, &JOB_REF)
 }
 
-fn open_instruction(controller: Option<AccountId>) -> Instruction {
+fn open_instruction(controller: Option<Actor>) -> Instruction {
     Instruction::Open {
         job_ref: JOB_REF,
         provider: provider().id,
@@ -302,6 +311,15 @@ fn open_instruction(controller: Option<AccountId>) -> Instruction {
         amount: AMOUNT,
         deadline: DEADLINE,
         controller,
+    }
+}
+
+/// The controller's decision on this test's job, which goes straight to the job's actor.
+fn job_decision(decision: Decision) -> Instruction {
+    Instruction::Decide {
+        buyer: buyer().id,
+        job_ref: JOB_REF,
+        decision,
     }
 }
 
@@ -476,17 +494,18 @@ fn a_returned_job_is_refunded_before_the_deadline() {
 #[test]
 fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
     let mut chain = Chain::new();
-    chain.open_controlled_by(Some(CONTROLLER)).expect("open");
+    chain.open_controlled_by(Some(controller())).expect("open");
     // On a controlled job, delivering releases nothing: the controller judges it.
     chain.deliver(BEFORE).expect("deliver");
     assert_eq!(chain.job().released, 0);
     assert!(refused(&chain.claim_of(AMOUNT), 10));
+    // Its decisions go straight to the job, naming no party.
     chain
         .relay(
             &operator(),
-            buyer().id,
+            job(),
             vec![],
-            &release_of(200),
+            &job_decision(Decision::Release { amount: 200 }),
             &[],
             vec![],
             BEFORE,
@@ -495,9 +514,9 @@ fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
     chain
         .relay(
             &operator(),
-            provider().id,
+            job(),
             vec![],
-            &give_back(),
+            &job_decision(Decision::Return),
             &[],
             vec![],
             BEFORE,
@@ -511,6 +530,57 @@ fn a_controller_releases_part_and_returns_the_rest_without_the_parties() {
     assert_eq!(chain.balance(pay_to().id), 200);
     assert_eq!(chain.balance(refund_to().id), AMOUNT - 200);
     assert_eq!(chain.balance(job()), 0);
+}
+
+#[test]
+fn only_the_jobs_exact_controller_decides() {
+    let mut chain = Chain::new();
+    chain.open_controlled_by(Some(controller())).expect("open");
+    let release = job_decision(Decision::Release { amount: AMOUNT });
+    // Another actor of the controller's own program: the buyer's, when the buyer signs.
+    let other_actor = chain.relay(&buyer(), job(), vec![], &release, &[], vec![], BEFORE);
+    assert!(refused(&other_actor, 11), "{other_actor:?}");
+    // The transaction itself, with no program in between.
+    let top_level = chain.send(
+        &operator(),
+        escrow(job()),
+        &[escrow(job())],
+        Vec::new(),
+        &release,
+        BEFORE,
+    );
+    assert!(refused(&top_level, 11), "{top_level:?}");
+    // The old way, through a party's actor, needs that party now.
+    let through_party = chain.relay(
+        &operator(),
+        buyer().id,
+        vec![],
+        &release_of(AMOUNT),
+        &[],
+        vec![],
+        BEFORE,
+    );
+    assert!(refused(&through_party, 2), "{through_party:?}");
+    assert_eq!(chain.job().released, 0);
+}
+
+#[test]
+fn nobody_decides_a_job_without_a_controller() {
+    let mut chain = Chain::new();
+    chain.open().expect("open");
+    let release = job_decision(Decision::Release { amount: AMOUNT });
+    let relayed = chain.relay(&operator(), job(), vec![], &release, &[], vec![], BEFORE);
+    assert!(refused(&relayed, 11), "{relayed:?}");
+    let top_level = chain.send(
+        &buyer(),
+        escrow(job()),
+        &[escrow(job())],
+        Vec::new(),
+        &release,
+        BEFORE,
+    );
+    assert!(refused(&top_level, 11), "{top_level:?}");
+    assert_eq!(chain.job().released, 0);
 }
 
 #[test]
@@ -549,8 +619,8 @@ fn a_program_cannot_act_on_a_job_it_does_not_control_even_when_the_buyer_signs()
 #[test]
 fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
     let mut chain = Chain::new();
-    // The buyer signs, but the controller names no controller, or another program.
-    for named in [None, Some(PROGRAM)] {
+    // The buyer signs, but the controller names no controller, or another program's actor.
+    for named in [None, Some(Actor::new(operator().id, PROGRAM))] {
         let result = chain.relay(
             &buyer(),
             buyer().id,
@@ -564,13 +634,13 @@ fn a_program_opens_a_job_only_for_itself_and_cannot_claim_for_the_provider() {
     }
     assert_eq!(chain.balance(buyer().id), START);
 
-    chain.open_controlled_by(Some(CONTROLLER)).expect("open");
+    chain.open_controlled_by(Some(controller())).expect("open");
     chain
         .relay(
             &operator(),
-            buyer().id,
+            job(),
             vec![],
-            &release_of(AMOUNT),
+            &job_decision(Decision::Release { amount: AMOUNT }),
             &[],
             vec![],
             BEFORE,
@@ -624,7 +694,7 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
         refund_to: refund_to().id,
         amount: AMOUNT,
         deadline: DEADLINE,
-        controller: Some(CONTROLLER),
+        controller: Some(controller()),
     };
     chain
         .relay(
@@ -639,7 +709,7 @@ fn a_controllers_own_account_opens_and_refunds_a_job_through_it() {
         .expect("the treasury opens a job through the controller");
     assert_eq!(chain.balance(treasury), 0);
     assert_eq!(chain.balance(job), AMOUNT);
-    assert_eq!(chain.job_at(job).controller, Some(CONTROLLER));
+    assert_eq!(chain.job_at(job).controller, Some(controller()));
 
     let refund = Instruction::Refund {
         job_ref: JOB_REF,
@@ -725,23 +795,19 @@ fn decide(decision: Decision) -> ArbiterInstruction {
 fn the_arbiters_judge_pays_part_and_returns_the_rest() {
     let mut chain = Chain::new();
     open_with_judge(&mut chain);
-    assert_eq!(chain.job().controller, Some(ARBITER));
+    // The case's actor, where the judge's decisions come from.
+    assert_eq!(chain.job().controller, Some(Actor::new(case(), ARBITER)));
     assert_eq!(chain.balance(job()), AMOUNT);
 
     arbiter(
         &mut chain,
         &operator(),
         &decide(Decision::Release { amount: 200 }),
-        &[escrow(buyer().id)],
+        &[],
     )
     .expect("the judge releases part");
-    arbiter(
-        &mut chain,
-        &operator(),
-        &decide(Decision::Return),
-        &[escrow(provider().id)],
-    )
-    .expect("the judge returns the rest");
+    arbiter(&mut chain, &operator(), &decide(Decision::Return), &[])
+        .expect("the judge returns the rest");
     assert_eq!(chain.job().state, JobState::Returned);
 
     chain.claim_of(200).expect("the provider claims its part");
@@ -806,7 +872,7 @@ fn a_controller_cannot_open_a_job_for_a_buyer_who_did_not_sign() {
         &operator(),
         buyer().id,
         vec![],
-        &open_instruction(Some(CONTROLLER)),
+        &open_instruction(Some(controller())),
         &[native(buyer().id), native(job())],
         vec![],
         BEFORE,
