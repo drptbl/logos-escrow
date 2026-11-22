@@ -119,8 +119,9 @@ async fn main() -> Result<()> {
             };
             // The buyer's escrow actor and both native balances, for the escrow's Open.
             let job_account = client.job_account(&job);
+            // The wallet names one account by one identity in a transaction: the buyer signs.
             let more = vec![
-                AccountIdentity::PublicNoSign(job.buyer).select_program_actor_state(escrow),
+                AccountIdentity::Public(job.buyer).select_program_actor_state(escrow),
                 AccountIdentity::Public(job.buyer).balance(),
                 AccountIdentity::PublicNoSign(job_account).balance(),
             ];
