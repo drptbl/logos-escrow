@@ -2,7 +2,7 @@
 
 Job escrow for the Logos Execution Zone. A buyer locks a payment for one job and releases it to the provider in parts, or all at once when the provider delivers. The buyer gets back what was never released when the provider doesn't deliver by the deadline.
 
-Built for agent services in [logos-mcp](https://github.com/drptbl/logos-mcp), but any LEZ wallet can call it, and other programs can build on it: a job can name a controller program, such as a marketplace, a DAO or an arbiter, that decides what the provider gets. Testnet only: LEZ is not meant for real funds yet.
+Built for agent services in [logos-mcp](https://github.com/drptbl/logos-mcp), but any LEZ wallet can call it, and other programs can build on it: a job can name a controller, one actor of a program such as a marketplace, a DAO or an arbiter, that decides what the provider gets. Testnet only: LEZ is not meant for real funds yet.
 
 ## Status
 
@@ -88,7 +88,7 @@ LEZ 0.4 delivers each message to an actor: one account's state under one program
 
 LEZ admits a public account the chain has never seen into a transaction only with its public key as evidence. So a `Claim` or `Refund` to a fresh public `pay_to` or `refund_to` carries that account's key. The side being paid sends the call, so it has it.
 
-Name every party, payee and controller by its canonical account id. LEZ resolves a private sender's blinded alias to its real account before delivery, so a job that recorded an alias would never match its party's calls.
+Name every party, payee and controller by its canonical account id. LEZ delivers a message sent to a blinded alias to the real account behind it, so a job that recorded an alias would never match its party's calls.
 
 Each instruction also carries the values the record must match, and the call fails when they don't. Read the record first: `Deliver` quotes its `deadline`, a `Claim` takes at most `released - claimed`, and a `Refund` exactly `amount - released`. A `Refund` after a `Return` passes `deadline` 0, because the deadline no longer applies.
 
@@ -212,7 +212,7 @@ cargo run -p logos_escrow_cli -- show --buyer <id> --job-ref <hex>
 
 | Command | What it does |
 | --- | --- |
-| `open` | Buyer: locks `--amount` for `--provider` until `--deadline-ms`, or `--in-secs` from now. `--controller` names a controller. |
+| `open` | Buyer: locks `--amount` for `--provider` until `--deadline-ms`, or `--in-secs` from now. `--controller <program> --controller-account <account>` names the controller actor. |
 | `deliver` | Provider: records `--result`, a 32-byte hex hash, before the deadline. |
 | `release` | Buyer: lets the provider claim `--amount` more, or everything left without it. |
 | `claim` | Provider: pulls everything released and not yet claimed to the job's `pay_to`. |

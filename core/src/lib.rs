@@ -5,9 +5,10 @@
 //! releases all of it; the provider claims what is released. The buyer refunds what was never
 //! released once the deadline passes, or once the provider returns the job.
 //!
-//! A job may name a controller program, such as a marketplace, a DAO or an arbiter. It may
-//! release and return the job without the parties, and it decides what a delivery is worth: on a
-//! controlled job, delivering releases nothing.
+//! A job may name a controller, one actor of a program such as a marketplace, a DAO or an
+//! arbiter. It decides what a delivery is worth: it may release and return the job without the
+//! parties, by a `Decide` sent straight to the job's actor, and on a controlled job delivering
+//! releases nothing.
 //!
 //! LEZ v0.4 delivers each message to one actor, an account's state under a program. A party
 //! sends its instruction to its own actor under the escrow, where `is_authorized` says whether it
@@ -159,9 +160,10 @@ pub enum EscrowError {
     /// The instruction's `amount` is zero, or more than it may release or claim, or not what a
     /// refund returns.
     WrongAmount,
-    /// A program other than the job's controller called the escrow, or a program opened a job
-    /// without naming itself. LEZ carries a signer's authorization into every chained call, so
-    /// a program the parties sign for could otherwise act on their jobs.
+    /// A program other than the job's controller's called the escrow, a program opened a job
+    /// without naming one of its own actors, or a decision came from anyone but the job's exact
+    /// controller. LEZ carries a signer's authorization into every chained call, so a program
+    /// the parties sign for could otherwise act on their jobs.
     NotDirect,
 }
 
