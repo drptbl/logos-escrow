@@ -94,8 +94,8 @@ impl Devnet {
         .expect("open the wallet")
     }
 
-    /// Runs the CLI and returns its output, failing the test if it fails.
-    fn cli(&self, args: &[&str]) -> String {
+    /// Runs the CLI, and returns whether it succeeded and what it printed.
+    fn run(&self, args: &[&str]) -> (bool, String) {
         let elf = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../methods/guest/target/riscv32im-risc0-zkvm-elf/docker/logos_escrow.bin");
         let output = Command::new(env!("CARGO_BIN_EXE_logos-escrow"))
@@ -110,23 +110,21 @@ impl Devnet {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            output.status.success(),
-            "logos-escrow {args:?} failed:\n{text}"
-        );
+        (output.status.success(), text)
+    }
+
+    /// Runs the CLI and returns its output, failing the test if it fails.
+    fn cli(&self, args: &[&str]) -> String {
+        let (succeeded, text) = self.run(args);
+        assert!(succeeded, "logos-escrow {args:?} failed:\n{text}");
         text
     }
 
     /// Runs the CLI expecting it to fail, and returns its output.
     fn cli_fails(&self, args: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_logos-escrow"))
-            .args(args)
-            .env("LEE_WALLET_HOME_DIR", &self.home)
-            .env("LOGOS_PROGRAM_ESCROW", self.program.to_string())
-            .output()
-            .expect("run the CLI");
-        assert!(!output.status.success(), "logos-escrow {args:?} succeeded");
-        String::from_utf8_lossy(&output.stderr).into_owned()
+        let (succeeded, text) = self.run(args);
+        assert!(!succeeded, "logos-escrow {args:?} succeeded:\n{text}");
+        text
     }
 
     /// Runs one escrow call and returns the job's state afterwards.
@@ -201,7 +199,7 @@ fn job_ref() -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs a running devnet: logos-devnet up, then run this under logos-devnet exec"]
+#[ignore = "needs a fresh devnet: logos-devnet reset, then run this under logos-devnet exec"]
 async fn every_flow_settles_on_a_devnet() {
     let devnet = Devnet::new();
     let payer = devnet.payer.to_string();
@@ -267,6 +265,29 @@ async fn every_flow_settles_on_a_devnet() {
         devnet.public_balance(devnet.provider).await,
         before + AMOUNT
     );
+
+    // Paid to a public account the wallet holds no key for: the CLI won't place the payout
+    // until told it's public, then pays it.
+    let job = job_ref();
+    let elsewhere = devnet.controller;
+    let before = devnet.public_balance(elsewhere).await;
+    let mut to_elsewhere = open(&job, "600", None);
+    to_elsewhere[10] = elsewhere.to_string();
+    assert_eq!(to_elsewhere[9], "--pay-to");
+    assert_eq!(call(to_elsewhere), "Open");
+    assert_eq!(call(on(&job, "deliver", &["--result", &job])), "Delivered");
+    let unplaced = devnet.cli_fails(
+        &on(&job, "claim", &[])
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        unplaced.contains("can't tell what kind of account"),
+        "{unplaced}"
+    );
+    assert_eq!(call(on(&job, "claim", &["--public-payee"])), "Delivered");
+    assert_eq!(devnet.public_balance(elsewhere).await, before + AMOUNT);
 
     // Public parties: open, the deadline passes, refund.
     let job = job_ref();
@@ -351,9 +372,29 @@ async fn every_flow_settles_on_a_devnet() {
     let (pbuyer, pprovider) = (private_buyer.to_string(), private_provider.to_string());
     let fees = private_fees.to_string();
 
-    for flow in ["claim", "return"] {
+    for flow in ["claim", "return", "release", "pre-funded"] {
         let job = job_ref();
         let pay_to = devnet.cli(&["payout-address"]).trim().to_owned();
+        if flow == "pre-funded" {
+            // Someone pays into the fresh pay_to first, so it holds a note before the claim.
+            let mut wallet = devnet.wallet();
+            wallet.set_private_fee_payer(Some(private_fees));
+            let (hash, _) = NativeTokenTransfer(&wallet)
+                .transfer(
+                    AccountIdentity::Public(devnet.payer),
+                    AccountIdentity::PrivateOwned(pay_to.parse().expect("an account id")),
+                    1,
+                    CreditDelivery::Automatic,
+                )
+                .await
+                .expect("pay into the pay_to first");
+            wallet
+                .poll_transaction(hash)
+                .await
+                .expect("the transfer lands");
+            wallet.sync_to_latest_block().await.expect("sync");
+            wallet.store_persistent_data().expect("save the wallet");
+        }
         let refund_to = devnet.cli(&["payout-address"]).trim().to_owned();
         let open = [
             "--payer",
@@ -390,14 +431,27 @@ async fn every_flow_settles_on_a_devnet() {
             .map(str::to_owned)
             .collect()
         };
-        if flow == "claim" {
-            assert_eq!(call(on("deliver", &["--result", &job])), "Delivered");
-            assert_eq!(call(on("claim", &[])), "Delivered");
-            assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
-        } else {
-            assert_eq!(call(on("return", &[])), "Returned");
-            assert_eq!(call(on("refund", &[])), "Refunded");
-            assert_eq!(devnet.private_balance(&refund_to).await, AMOUNT);
+        match flow {
+            "claim" => {
+                assert_eq!(call(on("deliver", &["--result", &job])), "Delivered");
+                assert_eq!(call(on("claim", &[])), "Delivered");
+                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
+            }
+            "return" => {
+                assert_eq!(call(on("return", &[])), "Returned");
+                assert_eq!(call(on("refund", &[])), "Refunded");
+                assert_eq!(devnet.private_balance(&refund_to).await, AMOUNT);
+            }
+            "release" => {
+                assert_eq!(call(on("release", &[])), "Open");
+                assert_eq!(call(on("claim", &[])), "Open");
+                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT);
+            }
+            _ => {
+                assert_eq!(call(on("deliver", &["--result", &job])), "Delivered");
+                assert_eq!(call(on("claim", &[])), "Delivered");
+                assert_eq!(devnet.private_balance(&pay_to).await, AMOUNT + 1);
+            }
         }
     }
     std::fs::remove_dir_all(&devnet.home).ok();
