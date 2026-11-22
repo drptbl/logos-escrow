@@ -7,7 +7,7 @@ use lee_core::{
     program::{ReceiveInput, Response, SyncMessage},
 };
 use logos_escrow_core::{
-    Decision, EscrowError, Instruction, Job, JobState, handle, job_account_id, job_seed,
+    Decision, EscrowError, Instruction, Job, JobState, events, handle, job_account_id, job_seed,
 };
 
 const PROGRAM: AccountId = AccountId::new([7; 32]);
@@ -879,6 +879,99 @@ fn nobody_releases_a_returned_job() {
         )
         .map(drop),
         Err(EscrowError::WrongState)
+    );
+}
+
+/// The event a response emitted, with its data decoded.
+fn event<T: borsh::BorshDeserialize>(response: &Response, name: &str) -> T {
+    let selector = events::selector(name);
+    let found = response
+        .events
+        .iter()
+        .find(|event| event.selector == selector)
+        .unwrap_or_else(|| panic!("no {name} event"));
+    borsh::from_slice(&found.data).expect("event data decodes")
+}
+
+/// Literals from Python's `hashlib`: the first 8 bytes of `sha256("logos_escrow::<Event>")`,
+/// LEZ's convention for event selectors.
+#[test]
+fn event_selectors_are_stable() {
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    for (name, selector) in [
+        ("Opened", "bd302df617c1685f"),
+        ("Delivered", "a0cf04b66d2e0687"),
+        ("Released", "95d8eff8ea992b74"),
+        ("Claimed", "5273036ec2490250"),
+        ("Returned", "a5eff4ddf518f44f"),
+        ("Refunded", "604c2adf6947f950"),
+    ] {
+        assert_eq!(hex(&events::selector(name)), selector, "{name}");
+    }
+}
+
+#[test]
+fn every_change_to_a_job_emits_its_event() {
+    let opened = call(signed(BUYER), &open_controlled_by(Some(controller())), &[]).expect("open");
+    assert_eq!(
+        event::<events::Opened>(&opened, "Opened"),
+        events::Opened {
+            job: job(),
+            buyer: BUYER,
+            provider: PROVIDER,
+            amount: AMOUNT,
+            deadline: DEADLINE,
+            controller: Some(controller()),
+        }
+    );
+    let delivered = call(signed(PROVIDER), &deliver(), &opened_controlled()).expect("deliver");
+    assert_eq!(
+        event::<events::Delivered>(&delivered, "Delivered"),
+        events::Delivered {
+            job: job(),
+            result: RESULT,
+        }
+    );
+    let released = decide(
+        Some(controller()),
+        Decision::Release { amount: 200 },
+        &opened_controlled(),
+    )
+    .expect("release");
+    assert_eq!(
+        event::<events::Released>(&released, "Released"),
+        events::Released {
+            job: job(),
+            amount: 200,
+        }
+    );
+    let claimed = call(signed(PROVIDER), &claim_of(200), &bytes(&released)).expect("claim");
+    assert_eq!(
+        event::<events::Claimed>(&claimed, "Claimed"),
+        events::Claimed {
+            job: job(),
+            to: PAY_TO,
+            amount: 200,
+        }
+    );
+    let returned = decide(Some(controller()), Decision::Return, &bytes(&released)).expect("return");
+    assert_eq!(
+        event::<events::Returned>(&returned, "Returned"),
+        events::Returned { job: job() }
+    );
+    let refunded = call(
+        signed(BUYER),
+        &refund_of(AMOUNT - 200, 0),
+        &bytes(&returned),
+    )
+    .expect("refund");
+    assert_eq!(
+        event::<events::Refunded>(&refunded, "Refunded"),
+        events::Refunded {
+            job: job(),
+            to: REFUND_TO,
+            amount: AMOUNT - 200,
+        }
     );
 }
 

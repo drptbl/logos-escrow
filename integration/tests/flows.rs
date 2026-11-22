@@ -14,10 +14,10 @@ use lee::{
 use lee_core::{
     account::{AccountId, Actor, Balance},
     native_token::{Message as NativeMessage, TransferError},
-    program::PdaSeed,
+    program::{PdaSeed, TransactionEvent},
 };
 use logos_escrow_arbiter::{ArbiterInstruction, Decision, case_account_id};
-use logos_escrow_core::{Instruction, Job, JobState, job_account_id};
+use logos_escrow_core::{Instruction, Job, JobState, events, job_account_id};
 
 const GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -112,6 +112,8 @@ fn load(path: &str) -> Program {
 struct Chain {
     state: V03State,
     block: u64,
+    /// What the last transaction emitted.
+    events: Vec<TransactionEvent>,
 }
 
 impl Chain {
@@ -127,7 +129,11 @@ impl Chain {
                 (CONTROLLER, load(CONTROLLER_GUEST)),
                 (ARBITER, load(ARBITER_GUEST)),
             ]);
-        Self { state, block: 1 }
+        Self {
+            state,
+            block: 1,
+            events: Vec::new(),
+        }
     }
 
     /// Sends `message` to `to`, declaring `actors`, admitting `fresh` and signed by `signer`.
@@ -152,13 +158,12 @@ impl Chain {
         );
         let witness_set = WitnessSet::for_message(&tx, &[&signer.key]);
         self.block += 1;
-        self.state
-            .transition_from_public_transaction(
-                &PublicTransaction::new(tx, witness_set),
-                self.block,
-                timestamp,
-            )
-            .map(drop)
+        self.events = self.state.transition_from_public_transaction(
+            &PublicTransaction::new(tx, witness_set),
+            self.block,
+            timestamp,
+        )?;
+        Ok(())
     }
 
     /// One escrow call from `signer`'s own actor, declaring it, the job and `more`.
@@ -581,6 +586,25 @@ fn nobody_decides_a_job_without_a_controller() {
     );
     assert!(refused(&top_level, 11), "{top_level:?}");
     assert_eq!(chain.job().released, 0);
+}
+
+#[test]
+fn every_change_reaches_the_chain_as_an_event() {
+    let mut chain = Chain::new();
+    chain.open().expect("open");
+    let [opened] = chain.events.as_slice() else {
+        panic!("one event, got {:?}", chain.events);
+    };
+    assert_eq!(opened.account_id, PROGRAM);
+    assert_eq!(opened.event.selector, events::selector("Opened"));
+    let data: events::Opened = borsh::from_slice(&opened.event.data).expect("decodes");
+    assert_eq!((data.job, data.amount), (job(), AMOUNT));
+    chain.deliver(BEFORE).expect("deliver");
+    assert_eq!(chain.events.len(), 1);
+    assert_eq!(
+        chain.events[0].event.selector,
+        events::selector("Delivered")
+    );
 }
 
 #[test]

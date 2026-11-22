@@ -24,6 +24,7 @@ use lee_core::{
 };
 use risc0_zkvm::sha::{Impl, Sha256 as _};
 
+pub mod events;
 mod rules;
 
 use rules::{Action, Origin};
@@ -372,7 +373,8 @@ fn to_job(program: AccountId, step: Step) -> SyncMessage {
     SyncMessage::new(Actor::new(job, program), &step).with_pda_seeds([seed])
 }
 
-/// At the job's actor: applies the job rules to its record, and pays out what they allow.
+/// At the job's actor: applies the job rules to its record, pays out what they allow, and emits
+/// the change.
 fn at_job(
     input: &ReceiveInput,
     buyer: AccountId,
@@ -420,8 +422,10 @@ fn at_job(
         },
         (action, _, _) => action,
     };
+    let event = event(job, &action);
     let next = rules::step(pre, origin, action.clone())?;
-    let response = Response::set_state(borsh::to_vec(&next).expect("a job record serializes"));
+    let response =
+        Response::set_state(borsh::to_vec(&next).expect("a job record serializes")).event(event);
     let payout = match action {
         Action::Claim { amount, .. } => Some((next.pay_to, amount)),
         Action::Refund { amount, .. } => Some((next.refund_to, amount)),
@@ -436,4 +440,52 @@ fn at_job(
         )),
         None => response,
     })
+}
+
+/// The event for `action` on `job`, once the rules allow it.
+fn event(job: AccountId, action: &Action) -> lee_core::program::ProgramEvent {
+    match action {
+        Action::Open(record) => events::emit(
+            "Opened",
+            &events::Opened {
+                job,
+                buyer: record.buyer,
+                provider: record.provider,
+                amount: record.amount,
+                deadline: record.deadline,
+                controller: record.controller,
+            },
+        ),
+        Action::Deliver { result, .. } => events::emit(
+            "Delivered",
+            &events::Delivered {
+                job,
+                result: *result,
+            },
+        ),
+        Action::Release { amount } => events::emit(
+            "Released",
+            &events::Released {
+                job,
+                amount: *amount,
+            },
+        ),
+        Action::Claim { payee, amount, .. } => events::emit(
+            "Claimed",
+            &events::Claimed {
+                job,
+                to: *payee,
+                amount: *amount,
+            },
+        ),
+        Action::Return { .. } => events::emit("Returned", &events::Returned { job }),
+        Action::Refund { payee, amount, .. } => events::emit(
+            "Refunded",
+            &events::Refunded {
+                job,
+                to: *payee,
+                amount: *amount,
+            },
+        ),
+    }
 }
