@@ -293,6 +293,9 @@ async fn every_flow_settles_on_a_devnet() {
     let job = job_ref();
     let before = devnet.public_balance(devnet.buyer).await;
     assert_eq!(call(open(&job, "4", None)), "Open");
+    let job_bytes = <[u8; 32]>::try_from(hex::decode(&job).expect("hex")).expect("32 bytes");
+    let locked = logos_escrow_core::job_account_id(&devnet.program, &devnet.buyer, &job_bytes);
+    assert_eq!(devnet.public_balance(locked).await, AMOUNT);
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(call(on(&job, "refund", &[])), "Refunded");
     assert_eq!(devnet.public_balance(devnet.buyer).await, before);
